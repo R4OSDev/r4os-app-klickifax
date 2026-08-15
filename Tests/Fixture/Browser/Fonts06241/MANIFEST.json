@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "generator": {
+    "file": "Tests/Fixture/Browser/Tools/generate_webfonts_06241.py",
+    "sha256": "cedf233d7be96f6cabf47dfcb6f321b5d69a0ff187f5e1f37ac5ced209c8a5d0",
+    "runtime": "Python 3 standard library only",
+    "check": "python Tests/Fixture/Browser/Tools/generate_webfonts_06241.py --check"
+  },
+  "base_generator": {
+    "file": "Code/System/Libraries/R4FONT/Tests/Tools/generate_minimal_fonts.py",
+    "sha256": "fece27d672b87502e0b37d01602bcd0e6993d1c84abd96a1e2629fb2878787ad"
+  },
+  "license": "BSD-3-Clause",
+  "copyright": "Copyright (c) 2026 R4OS contributors",
+  "license_notice": "LICENSE-BSD-3-Clause.txt",
+  "transformation": "Deterministically creates minimal uncompressed WOFF 1.0 containers from the audited R4FONT SFNT builder, with distinct CSS-test style metadata, advances and CMAP coverage.",
+  "guest_copy": {
+    "file": "TestInjection/Temp/KFXWEB.WOF",
+    "source": "regular.woff",
+    "sha256": "10dba35d4bd961730a901b0305cea70ac3583b5dae3045389526ec92ffae35e4"
+  },
+  "fixtures": [
+    {
+      "file": "regular.woff",
+      "sha256": "10dba35d4bd961730a901b0305cea70ac3583b5dae3045389526ec92ffae35e4",
+      "family": "R4OS Web Fixture",
+      "style": "Regular",
+      "weight": 400,
+      "bold": false,
+      "italic": false,
+      "codepoints": [65, 84, 86],
+      "advances": [600, 620, 640, 660],
+      "raster_18px": {"glyph": 1, "width": 11, "height": 13, "sha256": "afd31ea366bcf62249ba0b5f4f161a31398eebfbdaf3997d13eaa68a8407e95b"}
+    },
+    {
+      "file": "bold.woff",
+      "sha256": "6df7f0659fe469d802827707b8364e310b037c6ebb6fc8db62a413c0c4b5471e",
+      "family": "R4OS Web Fixture",
+      "style": "Bold",
+      "weight": 700,
+      "bold": true,
+      "italic": false,
+      "codepoints": [65, 84, 86],
+      "advances": [700, 720, 740, 760],
+      "raster_18px": {"glyph": 1, "width": 11, "height": 13, "sha256": "afd31ea366bcf62249ba0b5f4f161a31398eebfbdaf3997d13eaa68a8407e95b"}
+    },
+    {
+      "file": "italic.woff",
+      "sha256": "f65eb36a391cb42ef61cefb5feaad239cf488d594eb228affdd65ac27462c0f7",
+      "family": "R4OS Web Fixture",
+      "style": "Italic",
+      "weight": 400,
+      "bold": false,
+      "italic": true,
+      "codepoints": [65, 84, 86],
+      "advances": [650, 670, 690, 710],
+      "raster_18px": {"glyph": 1, "width": 11, "height": 13, "sha256": "afd31ea366bcf62249ba0b5f4f161a31398eebfbdaf3997d13eaa68a8407e95b"}
+    },
+    {
+      "file": "symbol.woff",
+      "sha256": "5d0387b92dfd334e6a4faf050d932731e99aeaa29e4aab4a6ac04f7c7c8a6ca3",
+      "family": "R4OS Web Symbols",
+      "style": "Regular",
+      "weight": 400,
+      "bold": false,
+      "italic": false,
+      "codepoints": [9733],
+      "advances": [600, 640, 640, 640],
+      "raster_18px": {"glyph": 1, "width": 11, "height": 13, "sha256": "afd31ea366bcf62249ba0b5f4f161a31398eebfbdaf3997d13eaa68a8407e95b"}
+    }
+  ]
+}

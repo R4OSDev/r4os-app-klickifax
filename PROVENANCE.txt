@@ -1,0 +1,16 @@
+﻿Klickifax provenance
+====================
+
+Fachliche Quelle:
+- Eingefrorener Altprojekt-Commit: 259cbfac272c47ac1a7828de973512d17b29ae10
+- Urspruenglicher Pfad: Code/System/Software/Klickifax
+
+Transfer in R4OS 0.64.18:
+- Quellcode, Manifest, Assets und vorhandene Projektdokumentation wurden
+  bytegenau aus dem eingefrorenen Commit uebernommen.
+- Die vorhandenen Modul- und Hosttest-Buildkanten werden auf gepinnte SDK-
+  und Libraries-Paketpfade abgebildet. Fachcode und Tests bleiben
+  unveraendert.
+- Die vier Webfont-Fixtures samt Manifest und Lizenz stammen bytegenau aus
+  `Tests/Fixture/Browser/Fonts06241` desselben eingefrorenen Commits und
+  liegen nun testlokal im Anwendungsrepository.

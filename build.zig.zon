@@ -1,0 +1,26 @@
+.{
+    .name = .r4os_klickifax,
+    .version = "0.29.5",
+    .fingerprint = 0x67f1a7384224996b,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .r4os_sdk = .{
+            .url = "https://github.com/R4OSDev/r4os-sdk/archive/418f49a795bcff0177fa622dddab57262bf503ed.tar.gz",
+            .hash = "r4os_sdk-0.64.17-NnPzAkJv7gBwJAoIcSZyXzHimQXv3t6e-4EyuzU2ZoAn",
+        },
+        .r4os_libraries = .{
+            .url = "https://github.com/R4OSDev/r4os-libraries/archive/11d1786cb557d70313a6d67aa2eb6debe43830c4.tar.gz",
+            .hash = "r4os_libraries-0.64.17-dH4fNXvwhgDwzMwClTeWWuqtvcrLqg7q4ciRQMnPASaN",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "Assets",
+        "module.R4MF",
+        "README.txt",
+        "src",
+        "Tests",
+        "PROVENANCE.txt",
+    },
+}

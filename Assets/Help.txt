@@ -1,0 +1,84 @@
+﻿Klickifax - Help
+================
+
+Klickifax is the web browser for R4OS.
+
+Navigation
+----------
+
+Back
+  Opens the previous address in the bounded browsing history.
+
+Forward
+  Returns to the next address after using Back.
+
+Stop
+  Cancels the active page load. The previous document remains visible.
+
+Reload
+  Loads the current internal or remote page again.
+
+Address
+  Enter an address and press Enter or choose Go. Addresses without a scheme
+  use HTTPS. Ctrl+L selects the complete address.
+
+Internal pages
+--------------
+
+about:klickifax
+  Klickifax home and version information.
+
+about:blank
+  Empty document.
+
+about:fixture-one
+about:fixture-two
+  Deterministic pages for navigation and history tests.
+
+about:search
+  Local HTML form fixture. Enter text, press Tab and submit with Enter.
+
+about:search-results
+  Deterministic result list produced by the local GET form.
+
+about:error
+  Deterministic browser error page.
+
+Keyboard
+--------
+
+Tab / Shift+Tab
+  Moves the focus through browser controls, form fields and document links.
+
+Enter / Space
+  Activates the focused button or link. Enter in a form field submits it.
+
+Ctrl+L
+  Focuses the address field and selects its contents.
+
+Up / Down
+  Scrolls the focused document by one text unit.
+
+Page Up / Page Down
+  Scrolls the focused document by one visible page.
+
+Home / End
+  Jumps to the beginning or end of the focused document.
+
+Escape
+  Stops an active load. Outside a load it closes Klickifax.
+
+R4OS 0.62.33 loads HTTP and TLS 1.2 responses through the shared R4OS web
+transport. HTML pages use the bounded CSS cascade, responsive software
+layout, installed fonts with Unicode fallback and a permanent document
+scrollbar. HTML GET forms, DOM focus/events, links, redirects and MIME-based
+document handling are active. R4JS page scripts can use Window, Document,
+events, timers, Fetch/XHR, URL, History, cookies and Web Storage. Same-Origin,
+CORS, CSP and mixed-content checks protect every scripted request. Persistent
+site data is stored outside the browser module in the R4OS configuration
+tree.
+
+PNG, JPEG, BMP and the documented static SVG subset are drawn through
+R4IMG. External SVG images and inline SVG elements share one bounded
+decoder. Inline SVG links participate in normal mouse and keyboard
+navigation.
