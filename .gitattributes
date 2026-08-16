@@ -14,3 +14,4 @@
 *.ico -text
 *.png -text
 *.woff -text
+*.md text eol=lf
