@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.29.5`
+- Version: `0.29.6`
 - Image target: `/R4OS/SOFTWARE/INTERNET/KLICKIFAX.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`

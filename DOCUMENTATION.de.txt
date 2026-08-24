@@ -83,6 +83,14 @@ pull-basierte Response-Streams und Navigation Timing an jedes Dokument.
 Requests gehen ausschliesslich ueber die gemeinsame SDK-Webtransport-
 Fassade.
 
+Lineare RegExp-Muster verbrauchen keine Backtrackingtiefe pro Atom;
+Quantifier behalten auch jenseits von 64 Wiederholungen greedy/lazy die
+korrekte Ergebnisreihenfolge. Nicht mehr sicher darstellbare Suchkapazitaet
+wird als `RangeError` sichtbar und nicht als normaler Nichttreffer. Beliebig
+viele Attribut-, Text- und Strukturmutationen desselben Scriptturns teilen
+genau eine ausstehende `dom_changed`-Aktion. Navigation, Formulare und andere
+geordnete Aktionen werden weiterhin einzeln und in Reihenfolge zugestellt.
+
 TextEncoder und TextDecoder sind echte markengepruefte Webinterfaces mit
 gemeinsamen Prototypen. TextEncoder erzeugt immer UTF-8 und EncodeInto
 schreibt nur vollstaendige Unicode-Skalare in ein echtes Uint8Array. Der

@@ -1,7 +1,7 @@
 R4OS_MODULE_MANIFEST=2
 KIND=R4X
 NAME=KLICKIFAX
-VERSION=0.29.5
+VERSION=0.29.6
 LANGUAGE=Zig
 SOURCE=src/main.zig
 ENTRY_MODE=app
@@ -37,6 +37,7 @@ META=feature=complete-abort-api
 META=feature=complete-fetch-api
 META=feature=complete-streams-api
 META=feature=complete-dom-api
+META=feature=coalesced-dom-dirty
 META=feature=mutation-observer
 META=feature=complete-history-location
 META=feature=navigation-api
