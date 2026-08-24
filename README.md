@@ -22,6 +22,13 @@ On Linux or macOS:
 
     ./Build.sh
 
+The regular workspace Test build omits this large Full-profile application.
+After changes to Klickifax, KlickifaxLive, or their browser protocol chain,
+run `Tools/Build.bat -testbrowser` or `./Tools/Build.sh -testbrowser` from the
+workspace root. That explicit path runs the repository tests and includes the
+browser bundle in the headless Test image. Full images continue to include
+Klickifax through `IMAGE_SCOPE=full`.
+
 The build starters resolve the current local R4OS dependency checkouts through
 `Settings.R4S`. The URL and hash entries in `build.zig.zon` record the
 last verified standalone dependency identities; workspace builds use the
