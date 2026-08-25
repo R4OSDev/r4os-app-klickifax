@@ -1,7 +1,7 @@
 R4OS_MODULE_MANIFEST=2
 KIND=R4X
 NAME=KLICKIFAX
-VERSION=0.29.6
+VERSION=0.29.7
 LANGUAGE=Zig
 SOURCE=src/main.zig
 ENTRY_MODE=app
@@ -69,6 +69,7 @@ META=feature=html-get-forms
 META=feature=dom-events
 META=feature=document-navigation
 META=feature=javascript-runtime-foundation
+META=feature=lazy-javascript-realm
 META=feature=javascript-web-bindings
 META=feature=origin-security
 META=feature=web-storage

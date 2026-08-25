@@ -83,6 +83,15 @@ pull-basierte Response-Streams und Navigation Timing an jedes Dokument.
 Requests gehen ausschliesslich ueber die gemeinsame SDK-Webtransport-
 Fassade.
 
+Reine HTML-/CSS-Dokumente halten nur den kompakten WebRuntime-Grundzustand.
+Der grosse JavaScript-Realm samt Plattformprogramm und Webbindungen wird
+erst beim ersten Seiten- oder Modulskript ueber den gemeinsamen
+ProgramAllocator angelegt. Dokumentabbruch, Navigation und Deinitialisierung
+geben Programme, Runtime-Inhalt und Realmblock ueber denselben idempotenten
+Abbaupfad frei. Der Grundzustand kann Ressourcen weiter planen und
+Lebenszyklusereignisse zaehlen, ohne dafuer vorbeugend JavaScript-Speicher zu
+reservieren.
+
 Lineare RegExp-Muster verbrauchen keine Backtrackingtiefe pro Atom;
 Quantifier behalten auch jenseits von 64 Wiederholungen greedy/lazy die
 korrekte Ergebnisreihenfolge. Nicht mehr sicher darstellbare Suchkapazitaet
