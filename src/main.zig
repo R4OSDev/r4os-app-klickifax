@@ -184,13 +184,6 @@ const WebCookieContext = struct {
     request_origin: ?r4os.web_security.Origin = null,
 };
 
-const WebRequestAuthorizationContext = struct {
-    runtime: *r4os.web_runtime.WebRuntime,
-    generation: u32,
-    kind: r4os.web_runtime.RequestKind,
-    mode: r4os.web_security.RequestMode,
-};
-
 const ExternalStyle = struct {
     offset: u32 = 0,
     len: u32 = 0,
@@ -281,10 +274,18 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
     defer app.deinitImages();
     defer app.deinitFontCache();
     defer if (app.response_cache) |*cache| cache.deinit();
+    defer app.navigation_sessions.deinit();
+    defer app.deinitResourceJobs();
     const result = app.run();
     if (app.web_state_initialized) saveBrowserStorage(&ctx.files, browser_storage, persistence_buffer);
     return result;
 }
+
+const ResourceSlot = struct {
+    request: r4os.web_runtime_jobs.RequestJob,
+    transaction: response_cache.Transaction = undefined,
+    cache_pending: bool = false,
+};
 
 const App = struct {
     ctx: *AppApi,
@@ -306,6 +307,8 @@ const App = struct {
     persistence_buffer: []u8,
     font_cache: ?font_cache_store.Store = null,
     response_cache: ?response_cache.Adapter = null,
+    navigation_sessions: r4os.app_web.SessionPool = .{},
+    resource_jobs: [r4os.app_web_jobs.capacity]?*ResourceSlot = .{null} ** r4os.app_web_jobs.capacity,
     navigation_cache_mode: r4os.web_response_cache.Mode = .normal,
     document_cache_mode: r4os.web_response_cache.Mode = .normal,
     font_cache_disabled: bool = false,
@@ -1660,7 +1663,7 @@ const App = struct {
                 self.saveRollback();
                 if (self.browser.forward()) self.loadCurrent("Forward") else self.has_rollback = false;
             },
-            .stop => if (self.loading_view_active or self.loading or self.script_running) self.requestStop() else self.setStatus("No page load is active."),
+            .stop => if (self.loading_view_active or self.loading or self.script_running or !self.page_runtime.resourcesSettled()) self.requestStop() else self.setStatus("No page load is active."),
             .reload => {
                 self.saveRollback();
                 self.browser.reload();
@@ -1884,13 +1887,15 @@ const App = struct {
                 self.setStatus(webRuntimeErrorText(err));
                 return false;
             };
-            var resource_rounds: usize = 0;
-            while (!self.page_runtime.resourcesSettled() and resource_rounds < 4) : (resource_rounds += 1) {
+            const resource_deadline = self.ctx.sys.ticks() +| self.ctx.sys.ticksFromMilliseconds(30_000);
+            while (!self.documentResourcesSettled() and self.ctx.sys.ticks() < resource_deadline) {
                 self.servicePageRequestsBurst();
-                self.ctx.sys.taskYield();
+                if (!webProgress(self)) break;
+                self.ctx.sys.sleepTicks(1);
             }
-            if (!self.page_runtime.resourcesSettled()) {
-                self.setStatus("The document resource queue did not settle.");
+            if (!self.documentResourcesSettled()) {
+                self.deinitResourceJobs();
+                self.setStatus("The document resource queue did not settle before its deadline.");
                 return false;
             }
             if (!self.rebuildWebFontRegistry()) return false;
@@ -1950,7 +1955,7 @@ const App = struct {
         if (completion.node >= parent_document.node_count) return false;
         const inherit_origin = parent_document.attribute(completion.node, "srcdoc") != null;
         const content_type = if (inherit_origin or completion.content_type.len == 0) "text/html" else completion.content_type;
-        const context = documents.create(
+        _ = documents.create(
             completion.generation,
             parent_runtime.security_context.document_origin,
             completion.node,
@@ -1962,13 +1967,8 @@ const App = struct {
             .{ .context = self, .complete = completePageResource },
             .{ .context = self, .inspect = inspectFrame },
         ) catch return false;
-        var rounds: usize = 0;
-        while (!context.runtime.resourcesSettled() and rounds < 4) : (rounds += 1) {
-            self.serviceRuntimeRequests(&context.runtime, 16);
-            self.ctx.sys.taskYield();
-        }
-        if (!context.runtime.resourcesSettled()) return false;
-        _ = documents.finalizeSettled(self.nowMilliseconds()) catch return false;
+        // Child transports are scheduled by the owner loop. Completing the
+        // parent response must not occupy a worker slot while awaiting children.
         return true;
     }
 
@@ -2232,6 +2232,7 @@ const App = struct {
     }
 
     fn clearLoaded(self: *App) void {
+        self.deinitResourceJobs();
         self.clearPageImages();
         if (self.subdocuments) |*documents| documents.retireParent(self.document_generation);
         if (self.runtime_active) {
@@ -2383,7 +2384,7 @@ const App = struct {
         return switch (target) {
             .back => self.browser.history.canBack(),
             .forward => self.browser.history.canForward(),
-            .stop => self.loading_view_active or self.loading or self.script_running,
+            .stop => self.loading_view_active or self.loading or self.script_running or (self.runtime_active and !self.page_runtime.resourcesSettled()),
             .document => true,
             else => true,
         };
@@ -3075,6 +3076,16 @@ const App = struct {
         return .{ .x = 0, .y = self.h - 26, .w = self.w, .h = 26 };
     }
 
+    fn documentResourcesSettled(self: *App) bool {
+        if (!self.page_runtime.resourcesSettled()) return false;
+        if (self.subdocuments) |*documents| {
+            for (documents.entries) |entry| if (entry) |document| {
+                if (!document.runtime.resourcesSettled()) return false;
+            };
+        }
+        return true;
+    }
+
     fn servicePageRequests(self: *App) void {
         self.servicePageRequestsLimited(page_resource_requests_per_slice, page_subdocument_requests_per_slice);
     }
@@ -3084,6 +3095,7 @@ const App = struct {
     }
 
     fn servicePageRequestsLimited(self: *App, top_level_maximum: usize, subdocument_maximum: usize) void {
+        self.pollResourceJobs();
         if (!self.runtime_active) return;
         self.serviceRuntimeRequests(self.page_runtime, top_level_maximum);
         if (self.subdocuments) |*documents| {
@@ -3095,40 +3107,109 @@ const App = struct {
         }
     }
 
+    fn runtimeForResourceJob(raw: ?*anyopaque, generation: u32) ?*r4os.web_runtime.WebRuntime {
+        const self: *App = @ptrCast(@alignCast(raw.?));
+        if (self.runtime_active and self.page_runtime.generation == generation) return self.page_runtime;
+        if (self.subdocuments) |*documents| if (documents.findGeneration(generation)) |document| return &document.runtime;
+        return null;
+    }
+
+    fn freeResourceJob(self: *App) ?*ResourceSlot {
+        const web = self.ctx.web orelse return null;
+        for (&self.resource_jobs) |*entry| {
+            if (entry.* == null) {
+                const slot = self.ctx.sys.allocator().create(ResourceSlot) catch return null;
+                slot.* = .{ .request = .{
+                    .job = .{ .transport = web },
+                    .allocator = self.ctx.sys.allocator(),
+                    .owner = .{ .context = self, .find = runtimeForResourceJob },
+                } };
+                entry.* = slot;
+            }
+            if (!entry.*.?.request.active) return entry.*.?;
+        }
+        return null;
+    }
+
     fn serviceRuntimeRequests(self: *App, runtime: *r4os.web_runtime.WebRuntime, maximum: usize) void {
         var serviced: usize = 0;
         while (serviced < maximum) : (serviced += 1) {
+            const slot = self.freeResourceJob() orelse break;
             const request = runtime.takeRequest() orelse break;
-            self.serviceRuntimeRequest(runtime, request);
-            _ = runtime.pump(self.nowMilliseconds(), page_runtime_jobs_per_slice) catch {};
+            slot.request.prepare(runtime, request, if (request.kind == .font) font_raw_response_capacity else response_capacity, if (request.kind == .font) font_response_capacity else response_capacity) catch {
+                runtime.failRequest(request.id, request.generation, "Resource response memory unavailable") catch {};
+                continue;
+            };
+            if (self.response_cache == null) self.response_cache = response_cache.Adapter.init(self.ctx.sys.allocator());
+            const mode = if (request.kind == .fetch or request.kind == .xhr or request.cache_mode != .normal) request.cache_mode else self.document_cache_mode;
+            const cached = self.response_cache.?.prepare(&slot.transaction, slot.request.url.bytes(), slot.request.job.raw, slot.request.job.body, .{
+                .transport = slot.request.options,
+                .mode = mode,
+                .partition = slot.request.options.network_partition,
+                .clock = .{ .context = self, .read = responseCacheClock },
+            });
+            if (cached) |result| {
+                self.publishResourceJob(slot, result);
+            } else {
+                slot.cache_pending = true;
+                if (!slot.request.start(slot.transaction.network_options))
+                    self.publishResourceJob(slot, .{ .value = .{ .failure = .read_failed } });
+            }
         }
     }
 
-    fn serviceRuntimeRequest(self: *App, runtime: *r4os.web_runtime.WebRuntime, request: *r4os.web_runtime.PendingRequest) void {
-        if (request.kind != .font) {
-            self.fetchRuntimeRequest(runtime, request, self.transport.raw[0..], self.transport.body[0..]);
-            return;
+    fn publishResourceJob(self: *App, slot: *ResourceSlot, result: response_cache.Result) void {
+        defer slot.request.release();
+        if (slot.cache_pending) slot.transaction.deinit();
+        slot.cache_pending = false;
+        switch (result.value) {
+            .response => |response| slot.request.complete(response, result.response_identity),
+            .failure => |err| {
+                if (slot.request.activeRuntime() != null) {
+                    if (slot.request.kind == .font) self.font_cache_failures += 1;
+                    slot.request.fail(if (result.only_cache_miss) "HTTP cache miss" else fetchErrorText(err), err == .policy_rejected);
+                }
+            },
         }
-        const allocator = self.ctx.sys.allocator();
-        const raw = allocator.alloc(u8, font_raw_response_capacity) catch {
-            self.font_cache_failures += 1;
-            runtime.failRequest(request.id, request.generation, "Font response memory unavailable") catch {};
-            return;
-        };
-        defer allocator.free(raw);
-        const body = allocator.alloc(u8, font_response_capacity) catch {
-            self.font_cache_failures += 1;
-            runtime.failRequest(request.id, request.generation, "Font response memory unavailable") catch {};
-            return;
-        };
-        defer allocator.free(body);
-        self.fetchRuntimeRequest(runtime, request, raw, body);
+    }
+
+    fn pollResourceJobs(self: *App) void {
+        for (self.resource_jobs) |entry| {
+            const slot = entry orelse continue;
+            if (!slot.request.active) continue;
+            if (@atomicLoad(u32, &self.stop_flag.value, .acquire) != 0) slot.request.job.cancel();
+            if (!slot.request.poll()) continue;
+            if (slot.request.activeRuntime() == null) {
+                if (slot.cache_pending) slot.transaction.deinit();
+                slot.cache_pending = false;
+                slot.request.release();
+                continue;
+            }
+            const result = slot.transaction.finish(slot.request.job.result);
+            if (result) |finished| self.publishResourceJob(slot, finished) else if (!slot.request.start(slot.transaction.network_options))
+                self.publishResourceJob(slot, .{ .value = .{ .failure = .read_failed } });
+        }
+    }
+
+    fn deinitResourceJobs(self: *App) void {
+        for (self.resource_jobs) |entry| if (entry) |slot| slot.request.job.cancel();
+        for (&self.resource_jobs) |*entry| {
+            const slot = entry.* orelse continue;
+            slot.request.deinit();
+            if (slot.cache_pending) slot.transaction.deinit();
+            self.ctx.sys.allocator().destroy(slot);
+            entry.* = null;
+        }
     }
 
     fn fetchWithCache(self: *App, web: *r4os.WebTransport, url: []const u8, raw: []u8, body: []u8, scratch: []u8, options: r4os.WebFetchOptions, mode: r4os.web_response_cache.Mode, partition: []const u8) response_cache.Result {
         if (self.response_cache == null) self.response_cache = response_cache.Adapter.init(self.ctx.sys.allocator());
+        var transport_options = options;
+        transport_options.sessions = &self.navigation_sessions;
+        transport_options.network_partition = partition;
+        transport_options.absolute_deadline = options.absolute_deadline orelse r4os.app_web.RequestDeadline.start(&web.network, options.timeout);
         return self.response_cache.?.fetch(web, url, raw, body, scratch, .{
-            .transport = options,
+            .transport = transport_options,
             .mode = mode,
             .partition = partition,
             .clock = .{ .context = self, .read = responseCacheClock },
@@ -3139,123 +3220,6 @@ const App = struct {
         const self: *App = @ptrCast(@alignCast(raw.?));
         const unix = self.cacheNowSeconds();
         return .{ .monotonic_ms = self.fontNowMilliseconds(), .unix_seconds = if (unix == 0) null else unix };
-    }
-
-    fn fetchRuntimeRequest(
-        self: *App,
-        runtime: *r4os.web_runtime.WebRuntime,
-        request: *r4os.web_runtime.PendingRequest,
-        raw_buffer: []u8,
-        body_buffer: []u8,
-    ) void {
-        var shared_ids: [r4os.web_runtime.max_requests]u32 = undefined;
-        const shared_count = runtime.joinResourceRequests(request, &shared_ids);
-        const generation = request.generation;
-        const request_kind = request.kind;
-        const request_url = request.url;
-        var cookie_context = WebCookieContext{
-            .app = self,
-            .same_site = runtime.security_context.document_origin.same(&request.target_origin),
-            .credentials = request.credentials,
-            .request_origin = runtime.security_context.document_origin,
-        };
-        var authorization_context = WebRequestAuthorizationContext{
-            .runtime = runtime,
-            .generation = generation,
-            .kind = request_kind,
-            .mode = request.mode,
-        };
-        var origin_buffer: [r4os.web_security.max_origin_host_bytes + 24]u8 = undefined;
-        const origin_header = runtime.security_context.document_origin.serialize(origin_buffer[0..]) orelse "null";
-        var partition_buffer: [512]u8 = undefined;
-        const partition = std.fmt.bufPrint(&partition_buffer, "opaque={d};mode={s};credentials={s}", .{
-            runtime.security_context.document_origin.opaque_id, @tagName(request.mode), @tagName(request.credentials),
-        }) catch unreachable;
-        if (self.ctx.web) |*web| {
-            const cached = self.fetchWithCache(
-                web,
-                request_url.bytes(),
-                raw_buffer,
-                body_buffer,
-                self.transport.scratch[0..],
-                .{
-                    .stop = &self.stop_flag,
-                    .progress = webProgress,
-                    .progress_context = self,
-                    .origin = origin_header,
-                    .method = request.method,
-                    .redirect = switch (request.redirect) {
-                        .follow => .follow,
-                        .error_mode => .error_mode,
-                        .manual => .manual,
-                    },
-                    .headers = request.requestHeaders(),
-                    .body = request.bodyBytes(),
-                    .cors = request.mode == .cors,
-                    .credentials_include = request.credentials == .include,
-                    .cookie_provider = webCookieProvider,
-                    .cookie_sink = webCookieSink,
-                    .cookie_context = &cookie_context,
-                    .target_authorizer = webRequestTargetAuthorizer,
-                    .target_authorization_context = &authorization_context,
-                },
-                if (request.kind == .fetch or request.kind == .xhr or request.cache_mode != .normal) request.cache_mode else self.document_cache_mode,
-                partition,
-            );
-            switch (cached.value) {
-                .response => |borrowed_response| {
-                    var snapshot: ?response_cache.Snapshot = null;
-                    defer if (snapshot) |*owned| owned.deinit();
-                    if (shared_count > 1) snapshot = response_cache.Snapshot.init(self.ctx.sys.allocator(), borrowed_response) catch {
-                        for (shared_ids[0..shared_count]) |id| if (runtime.requestInFlight(id, generation)) runtime.failRequest(id, generation, "Shared response memory unavailable") catch {};
-                        return;
-                    };
-                    const response = if (snapshot) |owned| owned.response else borrowed_response;
-                    for (shared_ids[0..shared_count]) |request_id| {
-                        if (!runtime.requestInFlight(request_id, generation)) continue;
-                        runtime.completeRequest(
-                            request_id,
-                            generation,
-                            .{
-                                .status = response.status,
-                                .secure = response.secure,
-                                .content_type = response.content_type orelse "",
-                                .content_security_policy = response.content_security_policy orelse "",
-                                .headers = response.headers,
-                                .redirected = response.redirects > 0,
-                                .final_url = response.final_url.bytes(),
-                                .access_control_allow_origin = response.access_control_allow_origin orelse "",
-                                .access_control_allow_credentials = response.access_control_allow_credentials,
-                                .set_cookies = response.set_cookies,
-                                .set_cookie_count = response.set_cookie_count,
-                                .manual_redirect = response.manual_redirect,
-                                .cookies_processed = true,
-                                .response_identity = cached.response_identity,
-                            },
-                            response.body,
-                        ) catch |err| {
-                            if (runtime == self.page_runtime and request_kind == .image) self.noteImageFailure(.other, @errorName(err), response.body.len);
-                            if (request_kind == .font) self.font_cache_failures += 1;
-                            if (err != error.CorsBlocked and err != error.StaleGeneration) self.setStatus(webRuntimeErrorText(err));
-                        };
-                    }
-                },
-                .failure => |err| {
-                    if (runtime == self.page_runtime and request_kind == .image) self.noteImageFailure(.fetch, fetchErrorText(err), 0);
-                    if (request_kind == .font) self.font_cache_failures += 1;
-                    for (shared_ids[0..shared_count]) |request_id| {
-                        if (!runtime.requestInFlight(request_id, generation)) continue;
-                        if (cached.only_cache_miss) runtime.failRequest(request_id, generation, "HTTP cache miss") catch {} else if (err == .policy_rejected)
-                            runtime.failRequestPolicy(request_id, generation, fetchErrorText(err)) catch {}
-                        else
-                            runtime.failRequest(request_id, generation, fetchErrorText(err)) catch {};
-                    }
-                },
-            }
-        } else {
-            if (request_kind == .font) self.font_cache_failures += 1;
-            for (shared_ids[0..shared_count]) |request_id| if (runtime.requestInFlight(request_id, generation)) runtime.failRequest(request_id, generation, "Web transport unavailable") catch {};
-        }
     }
 
     fn pumpPageRuntime(self: *App) void {
@@ -4477,16 +4441,6 @@ fn webCookieSink(raw_context: ?*anyopaque, url: []const u8, header: []const u8) 
         if (credentials == .omit or (credentials == .same_origin and !request_origin.same(&origin))) return;
     }
     context.app.browser_storage.cookies.setFromHeader(&origin, webUrlPath(url), header) catch {};
-}
-
-fn webRequestTargetAuthorizer(raw_context: ?*anyopaque, url: []const u8) bool {
-    const context: *WebRequestAuthorizationContext = @ptrCast(@alignCast(raw_context orelse return false));
-    return context.runtime.authorizeRequestTarget(
-        context.generation,
-        context.kind,
-        context.mode,
-        url,
-    );
 }
 
 fn documentMetaCsp(document: *const r4os.html.Document) []const u8 {

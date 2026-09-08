@@ -158,7 +158,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     });
     response_cache_module.addImport("r4os", sdk.createR4osModule(b.graph.host, .Debug));
-    const response_cache_tests = b.addTest(.{ .root_module = response_cache_module, .filters = &.{ "cached transport", "shared response snapshot" } });
+    const response_cache_tests = b.addTest(.{ .root_module = response_cache_module, .filters = &.{ "cached transport", "shared response snapshot", "overlapping cache transactions" } });
     const run_response_cache_tests = b.addRunArtifact(response_cache_tests);
     const response_cache_step = b.step("response-cache-test", "Run focused HTTP response cache tests");
     response_cache_step.dependOn(&run_response_cache_tests.step);

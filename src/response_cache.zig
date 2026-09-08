@@ -35,24 +35,27 @@ pub const Adapter = struct {
         self.storage.deinit();
     }
 
-    pub fn fetch(self: *Adapter, transport: anytype, url: []const u8, raw: []u8, body: []u8, scratch: []u8, options: Options) Result {
+    /// All cache operations are owner-only. The transaction pins an old entry
+    /// while a worker transports the request; it owns generated header bytes.
+    pub fn prepare(self: *Adapter, transaction: *Transaction, url: []const u8, raw: []u8, body: []u8, options: Options) ?Result {
         const opts = options.transport;
+        transaction.* = .{ .adapter = self, .url = url, .options = options, .raw = raw, .body = body };
         if (stopped(opts)) return failure(.cancelled);
         if (opts.target_authorizer) |authorize| if (!authorize(opts.target_authorization_context, url)) return failure(.policy_rejected);
         const parsed = switch (http.parseUrl(url)) {
             .value => |value| value,
             else => return failure(.invalid_url),
         };
-        var cookie_buffer: [1024]u8 = undefined;
-        const cookie = opts.initial_cookie orelse if (opts.cookie_provider) |provider| provider(opts.cookie_context, url, &cookie_buffer) else opts.cookie;
-        var request_buffer: [cache.max_key_bytes]u8 = undefined;
-        const effective_headers = switch (http.buildRequest(&request_buffer, opts.method, parsed, .{ .headers = opts.headers, .cookie = cookie, .origin = opts.origin, .content_type = opts.content_type, .body = opts.body })) {
+
+        const cookie = opts.initial_cookie orelse if (opts.cookie_provider) |provider| provider(opts.cookie_context, url, &transaction.cookie_buffer) else opts.cookie;
+
+        const effective_headers = switch (http.buildRequest(&transaction.request_buffer, opts.method, parsed, .{ .headers = opts.headers, .cookie = cookie, .origin = opts.origin, .content_type = opts.content_type, .body = opts.body })) {
             .bytes => |bytes| bytes,
             else => return failure(.request_too_large),
         };
-        var context_buffer: [2048]u8 = undefined;
-        const context = std.fmt.bufPrint(&context_buffer, "{s}\n{s}\ncors={d};credentials={d};redirect={s}", .{ options.partition, opts.origin, @intFromBool(opts.cors), @intFromBool(opts.credentials_include), @tagName(opts.redirect) }) catch return failure(.request_too_large);
-        const key: cache.Key = .{ .url = url, .context = context, .headers = effective_headers };
+
+        const context = std.fmt.bufPrint(&transaction.context_buffer, "{s}\n{s}\ncors={d};credentials={d};redirect={s}", .{ options.partition, opts.origin, @intFromBool(opts.cors), @intFromBool(opts.credentials_include), @tagName(opts.redirect) }) catch return failure(.request_too_large);
+        transaction.key = .{ .url = url, .context = context, .headers = effective_headers };
         const eligible = opts.method == .get and opts.body.len == 0 and
             cache.header(opts.headers, "Authorization") == null and cache.header(opts.headers, "Range") == null and
             cache.header(opts.headers, "If-None-Match") == null and cache.header(opts.headers, "If-Modified-Since") == null and
@@ -62,18 +65,22 @@ pub const Adapter = struct {
         var mode = options.mode;
         if (controls.no_store) mode = .no_store else if (mode == .normal and (controls.no_cache or controls.max_age == 0 or controls.invalid_age)) mode = .no_cache;
         const started = options.clock.now();
-        const lookup = if (eligible) self.storage.lookup(key, mode, started) else cache.Lookup{ .action = if (mode == .only_if_cached) .only_miss else .miss };
-        var handle = lookup.handle;
-        defer if (handle) |held| self.storage.release(held);
+        const lookup = if (eligible) self.storage.lookup(transaction.key, mode, started) else cache.Lookup{ .action = if (mode == .only_if_cached) .only_miss else .miss };
+        transaction.handle = lookup.handle;
+
         if (lookup.action == .only_miss) return .{ .value = .{ .failure = .read_failed }, .only_cache_miss = true };
         if (lookup.action == .hit) {
-            const stored = self.storage.view(handle.?, started).?;
-            return materialize(stored, url, parsed.scheme == .https, raw, body);
+            const stored = self.storage.view(transaction.handle.?, started).?;
+            const result = materialize(stored, url, parsed.scheme == .https, raw, body);
+            transaction.deinit();
+            return result;
         }
-        var conditional: [cache.max_header_bytes]u8 = undefined;
-        var request_options = opts;
+
+        transaction.network_options = opts;
+        const request_options = &transaction.network_options;
+        request_options.network_partition = options.partition;
         request_options.initial_cookie = cookie;
-        var cache_headers: [128]u8 = undefined;
+
         var cache_header_len: usize = 0;
         const control_value: []const u8 = switch (mode) {
             .no_store, .reload => "no-cache",
@@ -81,70 +88,117 @@ pub const Adapter = struct {
             else => "",
         };
         if (control_value.len != 0 and cache.header(opts.headers, "Cache-Control") == null) {
-            const line = std.fmt.bufPrint(&cache_headers, "Cache-Control: {s}\n", .{control_value}) catch unreachable;
+            const line = std.fmt.bufPrint(&transaction.cache_headers, "Cache-Control: {s}\n", .{control_value}) catch unreachable;
             cache_header_len = line.len;
         }
         if ((mode == .no_store or mode == .reload) and cache.header(opts.headers, "Pragma") == null) {
-            const line = std.fmt.bufPrint(cache_headers[cache_header_len..], "Pragma: no-cache\n", .{}) catch unreachable;
+            const line = std.fmt.bufPrint(transaction.cache_headers[cache_header_len..], "Pragma: no-cache\n", .{}) catch unreachable;
             cache_header_len += line.len;
         }
-        request_options.cache_headers = cache_headers[0..cache_header_len];
+        request_options.cache_headers = transaction.cache_headers[0..cache_header_len];
         if (lookup.action == .revalidate) {
-            const stored = self.storage.view(handle.?, started).?;
+            const stored = self.storage.view(transaction.handle.?, started).?;
             var used: usize = 0;
             for ([_][2][]const u8{ .{ "ETag", "If-None-Match" }, .{ "Last-Modified", "If-Modified-Since" } }) |pair| {
                 if (cache.header(stored.headers, pair[0])) |value| {
-                    const appended = std.fmt.bufPrint(conditional[used..], "{s}: {s}\n", .{ pair[1], value }) catch return failure(.request_too_large);
+                    const appended = std.fmt.bufPrint(transaction.conditional[used..], "{s}: {s}\n", .{ pair[1], value }) catch {
+                        transaction.deinit();
+                        return failure(.request_too_large);
+                    };
                     used += appended.len;
                 }
             }
-            request_options.conditional_headers = conditional[0..used];
+            request_options.conditional_headers = transaction.conditional[0..used];
         }
+        transaction.eligible = eligible;
+        transaction.mode = mode;
+        transaction.started = started;
+        transaction.secure = parsed.scheme == .https;
         self.transport_fetches +|= 1;
-        var result = transport.fetch(url, raw, body, scratch, request_options);
-        if (stopped(opts)) return failure(.cancelled);
-        if (result == .response and result.response.status == 304 and handle != null and request_options.conditional_headers.len != 0) {
-            const stored = self.storage.view(handle.?, options.clock.now()).?;
+        return null;
+    }
+
+    pub fn fetch(self: *Adapter, transport: anytype, url: []const u8, raw: []u8, body: []u8, scratch: []u8, options: Options) Result {
+        var transaction: Transaction = undefined;
+        if (self.prepare(&transaction, url, raw, body, options)) |result| return result;
+        defer transaction.deinit();
+        while (true) {
+            const result = transport.fetch(url, raw, body, scratch, transaction.network_options);
+            if (transaction.finish(result)) |finished| return finished;
+        }
+    }
+};
+
+/// Initialize with Adapter.prepare; keep its address and borrowed request data
+/// stable until finish/deinit. A null finish result requests one validator retry.
+pub const Transaction = struct {
+    adapter: *Adapter,
+    url: []const u8,
+    options: Options,
+    raw: []u8,
+    body: []u8,
+    key: cache.Key = undefined,
+    handle: ?cache.Handle = null,
+    eligible: bool = false,
+    mode: cache.Mode = .normal,
+    started: cache.Clock = .{ .monotonic_ms = 0 },
+    secure: bool = false,
+    network_options: web.FetchOptions = .{},
+    cookie_buffer: [1024]u8 = undefined,
+    request_buffer: [cache.max_key_bytes]u8 = undefined,
+    context_buffer: [2048]u8 = undefined,
+    conditional: [cache.max_header_bytes]u8 = undefined,
+    cache_headers: [128]u8 = undefined,
+
+    pub fn deinit(self: *Transaction) void {
+        if (self.handle) |held| self.adapter.storage.release(held);
+        self.handle = null;
+    }
+
+    /// A null result means retry using network_options and the same buffers
+    /// and absolute deadline. No cache or DOM state is touched by a worker.
+    pub fn finish(self: *Transaction, result: web.FetchResult) ?Result {
+        const storage = &self.adapter.storage;
+        if (stopped(self.options.transport)) {
+            self.deinit();
+            return failure(.cancelled);
+        }
+        if (result == .response and result.response.status == 304 and self.handle != null and self.network_options.conditional_headers.len != 0) {
+            const stored = storage.view(self.handle.?, self.options.clock.now()).?;
             const returned_tag = cache.header(result.response.headers, "ETag");
             const old_tag = cache.header(stored.headers, "ETag");
             const matching = returned_tag == null or (old_tag != null and std.mem.eql(u8, returned_tag.?, old_tag.?));
             var merged_buffer: [cache.max_header_bytes]u8 = undefined;
             const merged = if (matching) mergeHeaders(stored.headers, result.response.headers, stored.body.len, null, &merged_buffer) else null;
             if (merged) |headers| {
-                const restored = materialize(.{ .headers = headers, .body = stored.body, .identity = stored.identity, .age_seconds = cache.initialAgeSeconds(headers, options.clock.now(), started.monotonic_ms) }, url, parsed.scheme == .https, raw, body);
-                self.storage.release(handle.?);
-                handle = null;
+                const restored = materialize(.{ .headers = headers, .body = stored.body, .identity = stored.identity, .age_seconds = cache.initialAgeSeconds(headers, self.options.clock.now(), self.started.monotonic_ms) }, self.url, self.secure, self.raw, self.body);
+                self.deinit();
                 if (restored.value == .response) {
-                    self.revalidated +|= 1;
-                    if (mode != .no_store) _ = self.storage.store(key, headers, restored.value.response.body, options.clock.now(), started.monotonic_ms, stored.identity) catch null;
+                    self.adapter.revalidated +|= 1;
+                    if (self.mode != .no_store) _ = storage.store(self.key, headers, restored.value.response.body, self.options.clock.now(), self.started.monotonic_ms, stored.identity) catch null;
                 }
                 return restored;
             }
-            // An unusable validator response must not expose an empty 304 as
-            // the resource. Retry once without cache-generated validators.
-            request_options.conditional_headers = "";
-            self.transport_fetches +|= 1;
-            result = transport.fetch(url, raw, body, scratch, request_options);
+            self.network_options.conditional_headers = "";
+            self.adapter.transport_fetches +|= 1;
+            return null;
         }
-        if (handle) |held| {
-            self.storage.release(held);
-            handle = null;
-        }
-        if (stopped(opts)) return failure(.cancelled);
+        self.deinit();
         if (result == .response) {
             const response = result.response;
-            if (opts.method != .get and opts.method != .head and response.status >= 200 and response.status < 400) {
-                self.storage.invalidateUrl(url);
-                self.storage.invalidateUrl(response.final_url.bytes());
+            const method = self.options.transport.method;
+            if (method != .get and method != .head and response.status >= 200 and response.status < 400) {
+                storage.invalidateUrl(self.url);
+                storage.invalidateUrl(response.final_url.bytes());
             }
-            const identity = self.storage.newIdentity();
-            if (eligible and mode != .no_store) {
+            const identity = storage.newIdentity();
+            if (self.eligible and self.mode != .no_store) {
                 if (response.status == 200 and response.redirects == 0 and !response.manual_redirect) {
                     var headers_buffer: [cache.max_header_bytes]u8 = undefined;
                     if (mergeHeaders(response.headers, "", response.body.len, null, &headers_buffer)) |headers| {
-                        _ = self.storage.store(key, headers, response.body, options.clock.now(), started.monotonic_ms, identity) catch null;
-                    } else self.storage.invalidate(key);
-                } else self.storage.invalidate(key);
+                        _ = storage.store(self.key, headers, response.body, self.options.clock.now(), self.started.monotonic_ms, identity) catch null;
+                    } else storage.invalidate(self.key);
+                } else storage.invalidate(self.key);
             }
             return .{ .value = result, .response_identity = identity };
         }
@@ -288,6 +342,47 @@ const Fixture = struct {
         return .{ .response = .{ .status = if (unchanged) 304 else 200, .body = body[0..if (unchanged) 0 else self.body_text.len], .headers = headers, .content_type = cache.header(headers, "Content-Type"), .content_security_policy = null, .access_control_allow_origin = null, .access_control_allow_credentials = false, .set_cookie = cache.header(headers, "Set-Cookie"), .set_cookies = .{null} ** http.max_set_cookie_headers, .set_cookie_count = 0, .redirects = 0, .manual_redirect = false, .secure = false, .final_url = final } };
     }
 };
+
+test "overlapping cache transactions retain independent bytes and release cancelled pins" {
+    var adapter = Adapter.init(std.testing.allocator);
+    defer adapter.deinit();
+    var fixture: Fixture = .{};
+    var raw_a: [4096]u8 = undefined;
+    var raw_b: [4096]u8 = undefined;
+    var body_a: [128]u8 = undefined;
+    var body_b: [128]u8 = undefined;
+    var a: Transaction = undefined;
+    var b: Transaction = undefined;
+    const url_a = "http://cache.example/a";
+    const url_b = "http://cache.example/b";
+    try std.testing.expect(adapter.prepare(&a, url_a, &raw_a, &body_a, fixture.options(.normal)) == null);
+    defer a.deinit();
+    try std.testing.expect(adapter.prepare(&b, url_b, &raw_b, &body_b, fixture.options(.normal)) == null);
+    defer b.deinit();
+    const result_a = fixture.fetch(url_a, &raw_a, &body_a, &.{}, a.network_options);
+    fixture.body_text = "two";
+    const result_b = fixture.fetch(url_b, &raw_b, &body_b, &.{}, b.network_options);
+    const finished_b = b.finish(result_b).?;
+    const finished_a = a.finish(result_a).?;
+    try std.testing.expectEqualStrings("one", finished_a.value.response.body);
+    try std.testing.expectEqualStrings("two", finished_b.value.response.body);
+    try std.testing.expect(finished_a.response_identity != finished_b.response_identity);
+    try std.testing.expectEqualStrings("document", a.network_options.network_partition);
+
+    var stop: r4os.abi.R4StopFlag = .{};
+    var options = fixture.options(.no_cache);
+    options.transport.stop = &stop;
+    options.transport.absolute_deadline = .{ .deadline_tick = 42 };
+    try std.testing.expect(adapter.prepare(&a, url_a, &raw_a, &body_a, options) == null);
+    try std.testing.expect(a.handle != null);
+    const before = adapter.storage.bytes;
+    adapter.storage.invalidateUrl(url_a);
+    try std.testing.expectEqual(before, adapter.storage.bytes);
+    @atomicStore(u32, &stop.value, 1, .release);
+    try std.testing.expectEqual(web.Error.cancelled, a.finish(result_a).?.value.failure);
+    try std.testing.expect(a.handle == null and adapter.storage.bytes < before);
+    try std.testing.expectEqual(@as(u64, 42), a.network_options.absolute_deadline.?.deadline_tick);
+}
 
 test "cached transport separates modes and merges validators without repeating cookie effects" {
     var adapter = Adapter.init(std.testing.allocator);
