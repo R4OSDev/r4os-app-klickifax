@@ -306,6 +306,7 @@ const App = struct {
     subdocuments: ?r4os.web_documents.Set = null,
     persistence_buffer: []u8,
     font_cache: ?font_cache_store.Store = null,
+    prepared_cached_fonts: [document_fonts.max_faces]?font_cache_store.PreparedFontBinding = .{null} ** document_fonts.max_faces,
     response_cache: ?response_cache.Adapter = null,
     navigation_sessions: r4os.app_web.SessionPool = .{},
     resource_jobs: [r4os.app_web_jobs.capacity]?*ResourceSlot = .{null} ** r4os.app_web_jobs.capacity,
@@ -514,6 +515,7 @@ const App = struct {
         self.transport.stylesheet.reset();
         self.transport.font_registry.beginDocument(0);
         self.document_fonts.beginDocument(0);
+        self.prepared_cached_fonts = .{null} ** document_fonts.max_faces;
         self.ctx.sys.taskYield();
         self.transport.layout.reset(.{ .width = 1, .height = 1 });
         self.transport.interaction.reset();
@@ -1850,6 +1852,7 @@ const App = struct {
             self.document_generation +%= 1;
             if (self.document_generation == 0) self.document_generation = 1;
             self.document_fonts.beginDocument(self.document_generation);
+            self.prepared_cached_fonts = .{null} ** document_fonts.max_faces;
             const effective_csp = if (csp.len > 0) csp else documentMetaCsp(&self.transport.document);
             self.configurePageClock();
             self.page_runtime.beginDocument(
@@ -2274,6 +2277,7 @@ const App = struct {
         self.transport.stylesheet.reset();
         self.transport.font_registry.beginDocument(0);
         self.document_fonts.beginDocument(0);
+        self.prepared_cached_fonts = .{null} ** document_fonts.max_faces;
         self.transport.external_styles_len = 0;
         self.transport.external_style_count = 0;
         self.transport.layout.reset(.{ .width = 1, .height = 1 });
@@ -2319,6 +2323,15 @@ const App = struct {
         if (generation == self.document_generation) return true;
         const documents = if (self.subdocuments) |*value| value else return false;
         return documents.findGeneration(generation) != null;
+    }
+
+    fn discardPreparedCachedFont(self: *App, face_index: u16) void {
+        if (face_index >= self.prepared_cached_fonts.len) return;
+        if (self.prepared_cached_fonts[face_index]) |prepared| {
+            if (prepared.staged and prepared.document_id == self.document_fonts.document_id and prepared.demand_epoch == self.document_fonts.demand_epoch)
+                self.document_fonts.discardStaged(face_index);
+        }
+        self.prepared_cached_fonts[face_index] = null;
     }
 
     fn deinitFontCache(self: *App) void {
@@ -2558,6 +2571,7 @@ const App = struct {
 
         self.page_runtime.resetFontFaces();
         self.document_fonts.resetRules();
+        self.prepared_cached_fonts = .{null} ** document_fonts.max_faces;
         self.transport.font_registry.beginDocument(self.document_generation);
         active_rules = self.transport.stylesheet.activeFontFaceRulesForViewportSize(content.w, content.h);
         while (active_rules.next()) |rule| {
@@ -2626,6 +2640,7 @@ const App = struct {
                 return self.document_fonts.publishRevision();
             }
             self.document_fonts.cancelDemandEpoch();
+            self.prepared_cached_fonts = .{null} ** document_fonts.max_faces;
             self.setStatus(webRuntimeErrorText(err));
             return null;
         };
@@ -3635,6 +3650,7 @@ fn localWebFontAvailable(context: ?*anyopaque, probe: r4os.web_runtime.FontSourc
     for (app.font_infos[0..app.font_count]) |*info| {
         if ((info.flags & r4os.abi.gui_font_flag_renderable) == 0) continue;
         if (font_source_match.installedFace(spanZ(info.face[0..]), probe.source_value)) {
+            app.discardPreparedCachedFont(probe.face_index);
             return app.document_fonts.completeLocal(probe.face_index, info.id, app.fontNowMilliseconds());
         }
     }
@@ -3647,87 +3663,57 @@ fn cachedWebFontAvailable(
     final_url: *r4os.web_navigation.Url,
 ) bool {
     const app: *App = @ptrCast(@alignCast(context orelse return false));
-    const hit = lookupCachedWebFont(app, probe.request_origin, probe.resolved_url.bytes(), probe.format) orelse return false;
-    final_url.* = r4os.web_navigation.parse(hit.final_url.bytes()) catch {
+    if (probe.generation != app.document_generation or probe.face_index >= app.prepared_cached_fonts.len) return false;
+    app.discardPreparedCachedFont(probe.face_index);
+    var loaded = loadSelectedWebFont(app, probe) orelse return false;
+    defer loaded.deinit(app.ctx.sys.allocator());
+    const target = r4os.web_navigation.parse(loaded.final_url.bytes()) catch {
         app.font_cache_failures += 1;
         return false;
     };
+    // The runtime repeats this check before accepting the hit. Validate here
+    // too, before the application decodes its private prepared font copy.
+    if (!app.page_runtime.authorizeRequestTarget(probe.generation, .font, .cors, target.bytes())) return false;
+    const staged = app.document_fonts.stageBytes(probe.face_index, loaded.bytes) catch {
+        app.font_cache_failures += 1;
+        return false;
+    };
+    app.prepared_cached_fonts[probe.face_index] = .{
+        .generation = probe.generation,
+        .document_id = probe.document_id,
+        .demand_epoch = app.document_fonts.demand_epoch,
+        .face_index = probe.face_index,
+        .source_index = probe.source_index,
+        .format = probe.format,
+        .request_origin = probe.request_origin,
+        .requested_url = probe.resolved_url,
+        .final_url = target,
+        .staged = staged,
+    };
+    final_url.* = target;
     return true;
 }
 
-fn lookupCachedWebFont(
-    app: *App,
-    request_origin_value: r4os.web_security.Origin,
-    source_url: []const u8,
-    format: r4os.web_fonts.FontFormat,
-) ?font_cache_store.LookupResult {
+fn loadSelectedWebFont(app: *App, probe: r4os.web_runtime.FontSourceProbe) ?font_cache_store.OwnedLookupResult {
     app.initializeFontCache();
     const store = if (app.font_cache) |*value| value else return null;
-    if (source_url.len == 0) return null;
+    if (probe.resolved_url.len == 0) return null;
+    const format = cacheFormatForWebFont(probe.format);
+    if (format == null and probe.format != .unspecified) return null;
     var origin_buffer: [r4os.web_security.max_origin_host_bytes + 24]u8 = undefined;
-    const request_origin = request_origin_value.serialize(origin_buffer[0..]) orelse return null;
-    const now = app.cacheNowSeconds();
+    const request_origin = probe.request_origin.serialize(&origin_buffer) orelse return null;
     var attempt: usize = 0;
     while (attempt < font_cache_busy_retry_limit) : (attempt += 1) {
-        const transaction = app.nextFontCacheTransaction();
-        const lookup = if (cacheFormatForWebFont(format)) |cache_format|
-            store.lookup(request_origin, source_url, cache_format, now, transaction) catch |err| {
-                if (err == error.CacheBusy) {
-                    app.ctx.sys.taskYield();
-                    continue;
-                }
-                app.font_cache_failures += 1;
-                return null;
-            }
-        else if (format == .unspecified)
-            store.lookupAny(request_origin, source_url, now, transaction) catch |err| {
-                if (err == error.CacheBusy) {
-                    app.ctx.sys.taskYield();
-                    continue;
-                }
-                app.font_cache_failures += 1;
-                return null;
-            }
-        else
-            null;
-        return lookup;
-    }
-    app.font_cache_failures += 1;
-    return null;
-}
-
-fn loadCachedWebFont(
-    app: *App,
-    completion: r4os.web_runtime.ResourceCompletion,
-) ?font_cache_store.OwnedLookupResult {
-    const source_url = completion.requested_url.bytes();
-    const token = lookupCachedWebFont(app, completion.request_origin, source_url, completion.font_format) orelse return null;
-    if (!std.mem.eql(u8, token.final_url.bytes(), completion.final_url.bytes())) {
-        app.font_cache_failures += 1;
-        return null;
-    }
-    const store = if (app.font_cache) |*value| value else return null;
-    var origin_buffer: [r4os.web_security.max_origin_host_bytes + 24]u8 = undefined;
-    const request_origin = completion.request_origin.serialize(origin_buffer[0..]) orelse return null;
-    var attempt: usize = 0;
-    while (attempt < font_cache_busy_retry_limit) : (attempt += 1) {
-        const loaded = store.loadAuthorized(
-            app.ctx.sys.allocator(),
-            request_origin,
-            source_url,
-            token,
-            app.cacheNowSeconds(),
-            app.nextFontCacheTransaction(),
-        ) catch |err| {
+        return store.loadSelected(app.ctx.sys.allocator(), request_origin, probe.resolved_url.bytes(), format, app.cacheNowSeconds(), app.nextFontCacheTransaction()) catch |err| {
             if (err == error.CacheBusy) {
+                if (!app.fontGenerationActive(probe.generation) or app.should_exit or
+                    @atomicLoad(u32, &app.stop_flag.value, .acquire) != 0) return null;
                 app.ctx.sys.taskYield();
                 continue;
             }
             app.font_cache_failures += 1;
             return null;
         };
-        if (loaded != null) app.font_cache_hits += 1;
-        return loaded;
     }
     app.font_cache_failures += 1;
     return null;
@@ -3745,15 +3731,13 @@ fn cacheFormatForWebFont(format: r4os.web_fonts.FontFormat) ?r4os.web_font_cache
 
 fn completeWebFont(app: *App, completion: r4os.web_runtime.ResourceCompletion) bool {
     if (completion.font_source_origin == .cache) {
-        var loaded = loadCachedWebFont(app, completion) orelse return false;
-        defer loaded.deinit(app.ctx.sys.allocator());
-        const staged = app.document_fonts.stageBytes(completion.font_face_index, loaded.bytes) catch {
-            app.font_cache_failures += 1;
-            return false;
-        };
-        if (staged) _ = app.document_fonts.completeStaged(completion.font_face_index, app.fontNowMilliseconds());
+        if (completion.font_face_index >= app.prepared_cached_fonts.len) return false;
+        const prepared = font_cache_store.takePreparedFont(&app.prepared_cached_fonts[completion.font_face_index], completion, app.document_fonts.document_id, app.document_fonts.demand_epoch) orelse return false;
+        if (prepared.staged) _ = app.document_fonts.completeStaged(completion.font_face_index, app.fontNowMilliseconds());
+        app.font_cache_hits += 1;
         return true;
     }
+    app.discardPreparedCachedFont(completion.font_face_index);
     if (completion.body.len == 0 or completion.body.len > font_response_capacity) {
         app.font_cache_failures += 1;
         return false;

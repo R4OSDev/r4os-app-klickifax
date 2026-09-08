@@ -382,6 +382,33 @@ pub const OwnedLookupResult = struct {
     }
 };
 
+/// The bytes have already been copied into the document's private FaceStore.
+/// This bounded value binds their later activation to the original request.
+pub const PreparedFontBinding = struct {
+    generation: u32,
+    document_id: u64,
+    demand_epoch: u64,
+    face_index: u16,
+    source_index: u8,
+    format: r4os.web_fonts.FontFormat,
+    request_origin: r4os.web_security.Origin,
+    requested_url: r4os.web_navigation.Url,
+    final_url: r4os.web_navigation.Url,
+    staged: bool,
+};
+
+pub fn takePreparedFont(binding: *?PreparedFontBinding, completion: r4os.web_runtime.ResourceCompletion, document_id: u64, demand_epoch: u64) ?PreparedFontBinding {
+    const prepared = binding.* orelse return null;
+    if (completion.font_source_origin != .cache or completion.kind != .font or
+        prepared.generation != completion.generation or prepared.document_id != document_id or prepared.demand_epoch != demand_epoch or
+        prepared.face_index != completion.font_face_index or prepared.source_index != completion.font_source_index or prepared.format != completion.font_format or
+        !prepared.request_origin.same(&completion.request_origin) or
+        !std.mem.eql(u8, prepared.requested_url.bytes(), completion.requested_url.bytes()) or
+        !std.mem.eql(u8, prepared.final_url.bytes(), completion.final_url.bytes())) return null;
+    binding.* = null;
+    return prepared;
+}
+
 pub const SelfTestReport = struct {
     staged_and_committed: bool = false,
     immediate_lookup: bool = false,
@@ -420,12 +447,20 @@ fn objectFileDisposition(state: *const State, path: []const u8) ObjectFileDispos
     return if (state.catalog.find(id) != null) .referenced else .orphan;
 }
 
+pub const ReadStats = struct {
+    catalog_reads: u64 = 0,
+    object_reads: u64 = 0,
+    object_read_bytes: u64 = 0,
+    object_hash_bytes: u64 = 0,
+};
+
 pub const Store = struct {
     allocator: std.mem.Allocator,
     files: r4os.Files,
     policy: cache.Policy,
     state: *State,
     loaded: bool = false,
+    read_stats: ReadStats = .{},
 
     pub fn init(allocator: std.mem.Allocator, files: r4os.Files, policy: cache.Policy) Error!Store {
         if (!policy.valid()) return error.ReservationTooLarge;
@@ -694,6 +729,34 @@ pub const Store = struct {
         now: u64,
         transaction_id: u64,
     ) Error!?OwnedLookupResult {
+        return self.loadInternal(allocator, request_origin, source_url, null, token, now, transaction_id);
+    }
+
+    /// Selects and loads one immutable cache snapshot under one lease. The
+    /// caller must authorize its final URL before consuming or publishing it.
+    /// No separate lookup or second object read is needed after this result.
+    pub fn loadSelected(
+        self: *Store,
+        allocator: std.mem.Allocator,
+        request_origin: []const u8,
+        source_url: []const u8,
+        requested_format: ?cache.FontFormat,
+        now: u64,
+        transaction_id: u64,
+    ) Error!?OwnedLookupResult {
+        return self.loadInternal(allocator, request_origin, source_url, requested_format, null, now, transaction_id);
+    }
+
+    fn loadInternal(
+        self: *Store,
+        allocator: std.mem.Allocator,
+        request_origin: []const u8,
+        source_url: []const u8,
+        requested_format: ?cache.FontFormat,
+        token: ?LookupResult,
+        now: u64,
+        transaction_id: u64,
+    ) Error!?OwnedLookupResult {
         if (!self.loaded) return error.NotLoaded;
         if (transaction_id == 0) return error.InvalidTransaction;
         var origin = OriginKey{};
@@ -710,7 +773,14 @@ pub const Store = struct {
             return null;
         }
         const expiry = try expireAliases(working, now, self.policy.max_age_seconds);
-        const alias = authorizedAlias(working, origin.bytes(), source_url, token) orelse {
+        const selected = if (token) |expected|
+            authorizedAlias(working, origin.bytes(), source_url, expected)
+        else
+            selectAlias(working, origin.bytes(), source_url, requested_format) catch |err| {
+                try self.finishExpiry(working, &expiry, transaction_id);
+                return err;
+            };
+        const alias = selected orelse {
             try self.finishExpiry(working, &expiry, transaction_id);
             try releaseLockChecked(&lock);
             lock_open = false;
@@ -736,7 +806,7 @@ pub const Store = struct {
         defer if (bytes_owned) allocator.free(bytes);
         const object_path = try cache.objectPath(id);
         const path = absolute(object_path.bytes()) catch return error.BadPath;
-        self.readExact(path, bytes) catch |err| switch (err) {
+        self.readExactCounted(path, bytes, true) catch |err| switch (err) {
             error.ObjectMissing, error.ObjectCorrupt => {
                 try self.retireInvalidObject(working, &expiry, id, transaction_id);
                 try releaseLockChecked(&lock);
@@ -745,14 +815,14 @@ pub const Store = struct {
             },
             else => return err,
         };
-        if (!loadedObjectValid(metadata, token.final_url.bytes(), bytes)) {
+        if (!loadedObjectValidTracked(metadata, alias.final_url.bytes(), bytes, &self.read_stats)) {
             try self.retireInvalidObject(working, &expiry, id, transaction_id);
             try releaseLockChecked(&lock);
             lock_open = false;
             return null;
         }
 
-        const touched = touchLookupAccess(working, id, origin.bytes(), source_url, token.format, now);
+        const touched = touchLookupAccess(working, id, origin.bytes(), source_url, alias.format, now);
         if (expiry.changed or touched) {
             try self.publishState(working, transaction_id);
             self.deleteExpiryObjects(&expiry);
@@ -763,8 +833,8 @@ pub const Store = struct {
         bytes_owned = false;
         return .{
             .id = id,
-            .format = token.format,
-            .final_url = token.final_url,
+            .format = alias.format,
+            .final_url = alias.final_url,
             .bytes = bytes,
         };
     }
@@ -883,6 +953,7 @@ pub const Store = struct {
     }
 
     fn readPersistentState(self: *Store, output: *State) Error!bool {
+        self.read_stats.catalog_reads +|= 1;
         const path = absolute(cache.catalog_path) catch return error.BadPath;
         const info = switch (self.files.info(path.asZ())) {
             .value => |value| value,
@@ -1056,6 +1127,7 @@ pub const Store = struct {
     const Observation = struct { size: u64, digest: cache.Digest };
 
     fn observe(self: *Store, path: r4os.AbsoluteFilePath, scratch: []u8) Error!Observation {
+        self.read_stats.object_reads +|= 1;
         if (scratch.len == 0) return error.BufferTooSmall;
         const info = switch (self.files.info(path.asZ())) {
             .value => |value| value,
@@ -1074,6 +1146,8 @@ pub const Store = struct {
             };
             if (got == 0 or got > want) return error.ObjectCorrupt;
             hasher.update(scratch[0..got]);
+            self.read_stats.object_read_bytes +|= got;
+            self.read_stats.object_hash_bytes +|= got;
             offset += got;
         }
         var digest: cache.Digest = undefined;
@@ -1082,6 +1156,11 @@ pub const Store = struct {
     }
 
     fn readExact(self: *Store, path: r4os.AbsoluteFilePath, output: []u8) Error!void {
+        return self.readExactCounted(path, output, false);
+    }
+
+    fn readExactCounted(self: *Store, path: r4os.AbsoluteFilePath, output: []u8, count_object: bool) Error!void {
+        if (count_object) self.read_stats.object_reads +|= 1;
         const info = switch (self.files.info(path.asZ())) {
             .value => |value| value,
             .missing => return error.ObjectMissing,
@@ -1097,6 +1176,7 @@ pub const Store = struct {
                 .failure => return error.Io,
             };
             if (got == 0 or offset + got > end) return error.ObjectCorrupt;
+            if (count_object) self.read_stats.object_read_bytes +|= got;
             offset += got;
         }
     }
@@ -1253,8 +1333,13 @@ pub const Store = struct {
 };
 
 fn loadedObjectValid(metadata: *const cache.Metadata, final_url: []const u8, bytes: []const u8) bool {
+    return loadedObjectValidTracked(metadata, final_url, bytes, null);
+}
+
+fn loadedObjectValidTracked(metadata: *const cache.Metadata, final_url: []const u8, bytes: []const u8, stats: ?*ReadStats) bool {
     if (!metadata.valid() or bytes.len != metadata.size or bytes.len > cache.default_max_object_bytes) return false;
     const digest = cache.contentId(bytes);
+    if (stats) |counts| counts.object_hash_bytes +|= bytes.len;
     if (!std.mem.eql(u8, &digest, &metadata.id) or !std.mem.eql(u8, &digest, &metadata.checksum)) return false;
     const concrete = detectFormat(.unspecified, metadata.mime.bytes(), final_url, bytes) catch return false;
     return concrete == metadata.format;
@@ -2434,4 +2519,176 @@ test "persistent store and guest selftest paths typecheck without host IO" {
         const result = try selfTest(std.testing.allocator, files, 1);
         try std.testing.expect(result.ok());
     }
+}
+
+const WarmReadFixture = struct {
+    var current: ?*@This() = null;
+    catalog: []const u8 = &.{},
+    object: []const u8 = &.{},
+    object_path: cache.Path = .{},
+    leased: bool = false,
+    leases: usize = 0,
+    object_bytes: usize = 0,
+    catalog_bytes: usize = 0,
+
+    fn contents(self: *@This(), path: []const u8) ?[]const u8 {
+        if (std.ascii.eqlIgnoreCase(path, cache.catalog_path)) return self.catalog;
+        if (std.ascii.eqlIgnoreCase(path, self.object_path.bytes())) return self.object;
+        return null;
+    }
+    fn info(path: [*:0]const u8, out: *r4os.abi.FileInfo) callconv(.c) i32 {
+        const self = current.?;
+        std.debug.assert(self.leased);
+        out.* = .{};
+        const bytes = self.contents(std.mem.span(path)) orelse return 0;
+        out.exists = 1;
+        out.size = bytes.len;
+        return 1;
+    }
+    fn read(path: [*:0]const u8, offset: u32, output: [*]u8, capacity: u32) callconv(.c) i32 {
+        const self = current.?;
+        std.debug.assert(self.leased);
+        const text = std.mem.span(path);
+        const bytes = self.contents(text) orelse return -1;
+        if (offset >= bytes.len) return 0;
+        const count = @min(bytes.len - offset, capacity);
+        @memcpy(output[0..count], bytes[offset..][0..count]);
+        if (std.ascii.eqlIgnoreCase(text, cache.catalog_path)) self.catalog_bytes += count else self.object_bytes += count;
+        return @intCast(count);
+    }
+    fn begin(path: [*:0]const u8, flags: u32) callconv(.c) i32 {
+        const self = current.?;
+        std.debug.assert(std.ascii.eqlIgnoreCase(std.mem.span(path), lock_path));
+        std.debug.assert(flags & r4os.abi.file_stream_open_lease != 0);
+        if (self.leased) return r4os.abi.file_stream_error_exists;
+        self.leased = true;
+        self.leases += 1;
+        return r4os.abi.file_stream_result_ok;
+    }
+    fn abort(path: [*:0]const u8) callconv(.c) i32 {
+        const self = current.?;
+        std.debug.assert(self.leased and std.ascii.eqlIgnoreCase(std.mem.span(path), lock_path));
+        self.leased = false;
+        return r4os.abi.file_stream_result_ok;
+    }
+};
+
+test "selected warm load reads and hashes once and keeps a replaced object snapshot" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.alloc(u8, @intCast(cache.default_max_object_bytes));
+    defer allocator.free(bytes);
+    @memset(bytes, 0);
+    const probe = selfTestProbeBytes();
+    @memcpy(bytes[0..probe.len], &probe);
+    const origin = "https://document.example";
+    const source = "https://fonts.example/current.ttf";
+    const prepared = try cache.prepare(bytes, source, "font/ttf", .truetype, 0, .{});
+    const state = try allocator.create(State);
+    defer allocator.destroy(state);
+    state.* = .{};
+    _ = try state.recordPrepared(origin, source, &prepared);
+    const catalog_buffer = try allocator.alloc(u8, max_catalog_bytes);
+    defer allocator.free(catalog_buffer);
+    const catalog_bytes = try encodeState(state, catalog_buffer);
+    var fixture: WarmReadFixture = .{ .catalog = catalog_bytes, .object = bytes, .object_path = try cache.objectPath(prepared.metadata.id) };
+    WarmReadFixture.current = &fixture;
+    defer WarmReadFixture.current = null;
+    var table: r4os.abi.R4XStartR4Sys = .{
+        .file_info = @intFromPtr(&WarmReadFixture.info),
+        .file_read_at = @intFromPtr(&WarmReadFixture.read),
+        .file_stream_begin = @intFromPtr(&WarmReadFixture.begin),
+        .file_stream_abort = @intFromPtr(&WarmReadFixture.abort),
+    };
+    var bundle: r4os.program.Bundle = .{ .raw = undefined, .sys = &table };
+    var store = try Store.init(allocator, .{ .sys = r4os.r4sys.Context.init(&bundle) }, .{});
+    defer store.deinit();
+    store.loaded = true;
+    var loaded = (try store.loadSelected(allocator, origin, source, .truetype, 0, 1)).?;
+    defer loaded.deinit(allocator);
+    try std.testing.expectEqualSlices(u8, bytes, loaded.bytes);
+    try std.testing.expectEqual(@as(u64, 1), store.read_stats.catalog_reads);
+    try std.testing.expectEqual(@as(u64, 1), store.read_stats.object_reads);
+    try std.testing.expectEqual(bytes.len, store.read_stats.object_read_bytes);
+    try std.testing.expectEqual(bytes.len, store.read_stats.object_hash_bytes);
+    try std.testing.expectEqual(bytes.len, fixture.object_bytes);
+    try std.testing.expectEqual(catalog_bytes.len, fixture.catalog_bytes);
+    try std.testing.expectEqual(@as(usize, 1), fixture.leases);
+    try std.testing.expect(!fixture.leased);
+    std.debug.print("FONTREAD catalog={d} objects={d} file_bytes={d} hash_bytes={d}\n", .{ store.read_stats.catalog_reads, store.read_stats.object_reads, store.read_stats.object_read_bytes, store.read_stats.object_hash_bytes });
+
+    const token: LookupResult = .{ .id = loaded.id, .path = try cache.objectPath(loaded.id), .format = loaded.format, .final_url = loaded.final_url };
+    // Another cache owner replaces the alias/object after the lease ends.
+    // The previously returned bytes are independent and remain consumable.
+    bytes[bytes.len - 1] = 1;
+    const replacement = try cache.prepare(bytes, source, "font/ttf", .truetype, 0, .{});
+    state.* = .{};
+    _ = try state.recordPrepared(origin, source, &replacement);
+    fixture.catalog = try encodeState(state, catalog_buffer);
+    fixture.object_path = try cache.objectPath(replacement.metadata.id);
+    try std.testing.expectEqual(@as(u8, 0), loaded.bytes[loaded.bytes.len - 1]);
+    try std.testing.expectEqualSlices(u8, &prepared.metadata.id, &cache.contentId(loaded.bytes));
+    const before_read = fixture.object_bytes;
+    try std.testing.expect((try store.loadAuthorized(allocator, origin, source, token, 0, 2)) == null);
+    try std.testing.expectEqual(before_read, fixture.object_bytes);
+    var changed = (try store.loadSelected(allocator, origin, source, .truetype, 0, 3)).?;
+    defer changed.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), changed.bytes[changed.bytes.len - 1]);
+    try std.testing.expectEqualSlices(u8, &replacement.metadata.id, &changed.id);
+    try std.testing.expect(!fixture.leased);
+}
+
+test "prepared cached font stays bound to its document demand and source until consumed" {
+    const origin = try r4os.web_security.Origin.parse("https://document.example", 0);
+    const source = try r4os.web_navigation.parse("https://fonts.example/current.ttf");
+    const final_url = try r4os.web_navigation.parse("https://fonts.example/object.ttf");
+    const original: PreparedFontBinding = .{
+        .generation = 8,
+        .document_id = 8,
+        .demand_epoch = 3,
+        .face_index = 2,
+        .source_index = 1,
+        .format = .truetype,
+        .request_origin = origin,
+        .requested_url = source,
+        .final_url = final_url,
+        .staged = true,
+    };
+    var binding: ?PreparedFontBinding = original;
+    const completion: r4os.web_runtime.ResourceCompletion = .{
+        .generation = 8,
+        .resource_id = 4,
+        .node = 0,
+        .kind = .font,
+        .requested_url = source,
+        .final_url = final_url,
+        .url = final_url,
+        .status = 0,
+        .redirected = true,
+        .content_type = "",
+        .content_security_policy = "",
+        .body = "",
+        .byte_count = 0,
+        .font_face_index = 2,
+        .font_source_index = 1,
+        .font_format = .truetype,
+        .font_source_origin = .cache,
+        .request_origin = origin,
+    };
+    try std.testing.expect(takePreparedFont(&binding, completion, 9, 3) == null);
+    try std.testing.expect(takePreparedFont(&binding, completion, 8, 4) == null);
+    var stale = completion;
+    stale.generation = 7;
+    try std.testing.expect(takePreparedFont(&binding, stale, 8, 3) == null);
+    stale = completion;
+    stale.font_source_index = 0;
+    try std.testing.expect(takePreparedFont(&binding, stale, 8, 3) == null);
+    stale = completion;
+    stale.final_url = source;
+    try std.testing.expect(takePreparedFont(&binding, stale, 8, 3) == null);
+    stale = completion;
+    stale.request_origin = try r4os.web_security.Origin.parse("https://other.example", 0);
+    try std.testing.expect(takePreparedFont(&binding, stale, 8, 3) == null);
+    try std.testing.expectEqualDeep(original, binding.?);
+    try std.testing.expectEqualDeep(original, takePreparedFont(&binding, completion, 8, 3).?);
+    try std.testing.expect(takePreparedFont(&binding, completion, 8, 3) == null);
 }
