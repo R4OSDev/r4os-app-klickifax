@@ -69,7 +69,6 @@ const tls_scratch_capacity: usize = r4os.app_web.tls_scratch_bytes;
 const scrollbar_size: i32 = 17;
 const scroll_unit: i32 = 16;
 const max_fonts: usize = 65; // 64 installed R4F faces plus builtin
-const font_support_cache_entries: usize = 512;
 const local_document_capacity: usize = 8192;
 const form_body_capacity: usize = 8 * 1024;
 const script_step_budget: usize = 2 * 1024 * 1024;
@@ -152,13 +151,6 @@ const PageImage = struct {
 const SvgGlyphContext = struct {
     app: *const App,
     font_id: u32,
-};
-
-const FontSupportCacheEntry = struct {
-    valid: bool = false,
-    font_id: u32 = 0,
-    codepoint: u32 = 0,
-    supported: bool = false,
 };
 
 const RenderedPageImage = struct {
@@ -359,8 +351,8 @@ const App = struct {
     has_rollback: bool = false,
     font_infos: [max_fonts]r4os.abi.GuiFontInfo = .{r4os.abi.GuiFontInfo{}} ** max_fonts,
     font_count: usize = 0,
-    font_support_cache: [font_support_cache_entries]FontSupportCacheEntry = .{FontSupportCacheEntry{}} ** font_support_cache_entries,
-    font_support_cache_cursor: usize = 0,
+    font_support_cache: r4os.web_font.SupportCache = .{},
+    font_revision: u32 = 0,
     page_images: [max_page_images]PageImage = .{PageImage{}} ** max_page_images,
     image_loaded_count: usize = 0,
     image_decode_count: usize = 0,
@@ -421,11 +413,12 @@ const App = struct {
         self.updateTitle();
         self.address.selectAll();
         self.updateMetrics();
-        self.loadFonts();
+        _ = self.loadFonts();
         self.render();
         self.initializeWebState();
 
         while (!self.ctx.sys.programShouldClose() and !self.should_exit) {
+            if (self.refreshInstalledFonts()) self.render();
             var event: r4os.abi.GuiEvent = .{};
             var pending_mouse_move = PendingMouseMove{};
             while (self.ctx.desk.guiPollEvent(&event) > 0) {
@@ -452,11 +445,7 @@ const App = struct {
                     .mouse_up => self.handleMouseUp(event.x, event.y),
                     .key_down => self.handleKey(r4os.gui.eventKey(event)),
                     .font_changed => {
-                        self.loadFonts();
-                        self.refreshInlineSvgImages();
-                        self.web_font_rule_keys_valid = false;
-                        self.web_font_viewport_dirty = true;
-                        self.refreshResponsiveWebFonts();
+                        _ = self.refreshInstalledFonts();
                         self.render();
                     },
                     else => {},
@@ -551,6 +540,9 @@ const App = struct {
     }
 
     fn render(self: *App) void {
+        _ = self.refreshInstalledFonts();
+        if (self.ctx.draw.fontRevision() != self.font_revision) return;
+
         if (!self.ctx.draw.supportsGuiFrameContract()) {
             self.native_frame_failures +|= 1;
             self.setStatus("R4DRAW frame transactions are unavailable.");
@@ -605,6 +597,7 @@ const App = struct {
         _ = canvas.rect(status, status_bg);
         _ = canvas.rect(.{ .x = status.x, .y = status.y, .w = status.w, .h = 1 }, r4os.gui.default_palette.face_shadow);
         _ = canvas.textClipped(status.x + 6, status.y + 5, status.w - 12, scratch[0..], self.visibleStatus(), text, status_bg);
+        if (self.ctx.draw.fontRevision() != self.font_revision) return;
         if (self.native_frame_app_failed or self.native_paint_stats.failures != 0) {
             self.native_frame_failures +|= 1;
             self.setStatus("Klickifax discarded an incomplete document frame.");
@@ -1335,13 +1328,20 @@ const App = struct {
         if (value.len == 0 or width <= 0) return;
         const style = cssStyleForRenderOp(op);
         const metrics = self.transport.layout.measureStyledText(&style, value);
-        const catalog = self.fontCatalog();
-        var cursor: usize = 0;
+        var resolver: r4os.web_font.RunResolver(r4os.web_layout.FontFace) = .{
+            .context = self,
+            .callback = resolveLayoutFont,
+            .family = style.font_family,
+            .size = style.font_size,
+            .weight = style.font_weight,
+            .italic = style.italic,
+        };
+        var current = resolver.resolve(decodeUtf8Codepoint(value, 0));
+        var cursor = utf8SequenceLength(value, 0);
         var run_start: usize = 0;
         var draw_x = x;
-        var current = self.document_fonts.resolve(&self.transport.font_registry, catalog, style.font_family, style.font_size, style.font_weight, style.italic, decodeUtf8Codepoint(value, 0));
         while (cursor < value.len) {
-            const next_face = self.document_fonts.resolve(&self.transport.font_registry, catalog, style.font_family, style.font_size, style.font_weight, style.italic, decodeUtf8Codepoint(value, cursor));
+            const next_face = resolver.resolve(decodeUtf8Codepoint(value, cursor));
             if (cursor > run_start and next_face.id != current.id) {
                 draw_x += self.drawResolvedTextRun(canvas, viewport, draw_x, y, width - (draw_x - x), scratch, value[run_start..cursor], current, metrics.baseline, color, op.background);
                 run_start = cursor;
@@ -3014,19 +3014,48 @@ const App = struct {
         return @atomicLoad(u32, &self.stop_flag.value, .acquire) == 0;
     }
 
-    fn loadFonts(self: *App) void {
-        self.font_count = 0;
-        @memset(self.font_support_cache[0..], FontSupportCacheEntry{});
-        self.font_support_cache_cursor = 0;
-        const count = @min(@as(usize, @intCast(self.ctx.draw.fontCount())), self.font_infos.len);
-        var index: usize = 0;
-        while (index < count) : (index += 1) {
-            var info: r4os.abi.GuiFontInfo = .{};
-            if (self.ctx.draw.fontInfo(@intCast(index), &info) <= 0) continue;
-            if ((info.flags & r4os.abi.gui_font_flag_renderable) == 0) continue;
-            self.font_infos[self.font_count] = info;
-            self.font_count += 1;
-        }
+    fn refreshInstalledFonts(self: *App) bool {
+        if (self.ctx.draw.fontRevision() == self.font_revision) return false;
+        if (!self.loadFonts()) return false;
+        if (self.runtime_active) self.page_runtime.resetFontFaces();
+        self.document_fonts.resetRules();
+        self.prepared_cached_fonts = .{null} ** document_fonts.max_faces;
+        self.layout_valid = false;
+        self.web_font_rule_keys_valid = false;
+        self.web_font_viewport_dirty = true;
+        self.refreshInlineSvgImages();
+        self.refreshResponsiveWebFonts();
+        return true;
+    }
+
+    fn loadFonts(self: *App) bool {
+        const Reader = struct {
+            fn app(context: *anyopaque) *App {
+                return @ptrCast(@alignCast(context));
+            }
+            fn revision(context: *anyopaque) u32 {
+                return app(context).ctx.draw.fontRevision();
+            }
+            fn count(context: *anyopaque) usize {
+                return app(context).ctx.draw.fontCount();
+            }
+            fn info(context: *anyopaque, index: u32, out: *r4os.abi.GuiFontInfo) bool {
+                return app(context).ctx.draw.fontInfo(index, out) > 0;
+            }
+        };
+        var pending: [max_fonts]r4os.abi.GuiFontInfo = undefined;
+        const reader: r4os.web_font.CatalogReader = .{
+            .context = self,
+            .revision = Reader.revision,
+            .count = Reader.count,
+            .info = Reader.info,
+        };
+        const snapshot = reader.read(&pending) orelse return false;
+        @memcpy(self.font_infos[0..snapshot.count], pending[0..snapshot.count]);
+        self.font_count = snapshot.count;
+        self.font_revision = snapshot.revision;
+        self.font_support_cache = .{};
+        return true;
     }
 
     fn resolveFont(self: *const App, family: []const u8, size: i32, weight: u16, codepoint: ?u32) u32 {
@@ -3040,32 +3069,18 @@ const App = struct {
         };
     }
 
-    fn fontSupports(self: *const App, info: *const r4os.abi.GuiFontInfo, codepoint: u32) bool {
+    fn fontSupports(self: *const App, font_id: u32, codepoint: u32) bool {
         if (codepoint == ' ') return true;
-        var row: u32 = 0;
-        while (row < info.height) : (row += 1) {
-            if (self.ctx.draw.fontGlyphRow(info.id, codepoint, row) != 0) return true;
-        }
+        var bitmap: r4os.abi.GuiGlyphBitmap = .{};
+        if (self.ctx.draw.fontGlyphBitmap(font_id, codepoint, &bitmap) != 0) return false;
+        for (bitmap.rows[0..@min(bitmap.height, bitmap.rows.len)]) |bits| if (bits != 0) return true;
         return false;
     }
 
     fn cachedFontSupports(self: *App, font_id: u32, codepoint: u32) bool {
-        for (self.font_support_cache[0..]) |entry| {
-            if (entry.valid and entry.font_id == font_id and entry.codepoint == codepoint) return entry.supported;
-        }
-        var supported = false;
-        for (self.font_infos[0..self.font_count]) |*info| {
-            if (info.id != font_id) continue;
-            supported = self.fontSupports(info, codepoint);
-            break;
-        }
-        self.font_support_cache[self.font_support_cache_cursor] = .{
-            .valid = true,
-            .font_id = font_id,
-            .codepoint = codepoint,
-            .supported = supported,
-        };
-        self.font_support_cache_cursor = (self.font_support_cache_cursor + 1) % self.font_support_cache.len;
+        if (self.font_support_cache.get(self.font_revision, font_id, codepoint)) |supported| return supported;
+        const supported = self.fontSupports(font_id, codepoint);
+        self.font_support_cache.put(self.font_revision, font_id, codepoint, supported);
         return supported;
     }
 
