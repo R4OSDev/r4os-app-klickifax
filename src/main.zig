@@ -8,6 +8,7 @@ const model = @import("model.zig");
 const storage_layout = @import("storage_layout.zig");
 const inline_svg = @import("inline_svg.zig");
 const font_cache_store = @import("font_cache_store.zig");
+const response_cache = @import("response_cache.zig");
 const font_source_match = @import("font_source_match.zig");
 const document_fonts = @import("document_fonts.zig");
 const font_run_mask = @import("font_run_mask.zig");
@@ -126,6 +127,7 @@ const PageImage = struct {
     inline_svg: bool = false,
     generation: u32 = 0,
     resource_id: u32 = 0,
+    response_identity: u64 = 0,
     node: u16 = r4os.html.none,
     role: r4os.web_layout.ImageRole = .content,
     state: r4os.web_layout.ImageState = .missing,
@@ -278,6 +280,7 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
     defer app.deinitSubdocuments();
     defer app.deinitImages();
     defer app.deinitFontCache();
+    defer if (app.response_cache) |*cache| cache.deinit();
     const result = app.run();
     if (app.web_state_initialized) saveBrowserStorage(&ctx.files, browser_storage, persistence_buffer);
     return result;
@@ -302,6 +305,9 @@ const App = struct {
     subdocuments: ?r4os.web_documents.Set = null,
     persistence_buffer: []u8,
     font_cache: ?font_cache_store.Store = null,
+    response_cache: ?response_cache.Adapter = null,
+    navigation_cache_mode: r4os.web_response_cache.Mode = .normal,
+    document_cache_mode: r4os.web_response_cache.Mode = .normal,
     font_cache_disabled: bool = false,
     font_cache_transaction: u64 = 1,
     font_cache_hits: usize = 0,
@@ -353,6 +359,8 @@ const App = struct {
     font_support_cache_cursor: usize = 0,
     page_images: [max_page_images]PageImage = .{PageImage{}} ** max_page_images,
     image_loaded_count: usize = 0,
+    image_decode_count: usize = 0,
+    image_decode_reuses: usize = 0,
     image_fetch_failures: usize = 0,
     image_format_failures: usize = 0,
     image_decode_failures: usize = 0,
@@ -1656,6 +1664,8 @@ const App = struct {
             .reload => {
                 self.saveRollback();
                 self.browser.reload();
+                self.navigation_cache_mode = .reload;
+                defer self.navigation_cache_mode = .normal;
                 self.loadCurrent("Reloaded");
             },
             .diagnostics => self.toggleDiagnostics(),
@@ -1707,7 +1717,8 @@ const App = struct {
         self.render();
         if (self.ctx.web) |*web| {
             var cookie_context = WebCookieContext{ .app = self, .same_site = true };
-            const result = web.fetch(
+            const cached = self.fetchWithCache(
+                web,
                 self.browser.currentUrl().bytes(),
                 self.transport.raw[0..],
                 self.transport.body[0..],
@@ -1724,11 +1735,15 @@ const App = struct {
                     .cookie_sink = webCookieSink,
                     .cookie_context = &cookie_context,
                 },
+                self.navigation_cache_mode,
+                "navigation",
             );
+            const result = cached.value;
             self.loading = false;
             switch (result) {
                 .response => |response| {
                     self.clearLoaded();
+                    self.document_cache_mode = self.navigation_cache_mode;
                     self.loaded_len = response.body.len;
                     self.loaded_status = response.status;
                     self.loaded_secure = response.secure;
@@ -2051,6 +2066,21 @@ const App = struct {
         entry.node = completion.node;
         entry.role = role;
         entry.state = .loading;
+        entry.response_identity = completion.response_identity;
+        if (completion.response_identity != 0) {
+            for (&self.page_images) |*existing| {
+                if (existing == entry or !existing.used or existing.state != .ready or existing.inline_svg or
+                    existing.generation != completion.generation or existing.response_identity != completion.response_identity or
+                    existing.info.format == .svg) continue;
+                entry.pixels = self.ctx.sys.allocator().dupe(u32, existing.pixels) catch break;
+                entry.info = existing.info;
+                entry.state = .ready;
+                self.image_loaded_count += 1;
+                self.image_decode_reuses += 1;
+                self.resource_dirty = true;
+                return true;
+            }
+        }
         return self.decodePageImage(entry, completion.body, completion.content_type);
     }
 
@@ -2089,6 +2119,7 @@ const App = struct {
         };
         defer allocator.free(scratch);
         var glyph_context = SvgGlyphContext{ .app = self, .font_id = r4os.abi.gui_font_builtin_id };
+        self.image_decode_count += 1;
         const decoded = if (info.format == .svg)
             self.ctx.image.decodeSvg(
                 source,
@@ -3094,6 +3125,22 @@ const App = struct {
         self.fetchRuntimeRequest(runtime, request, raw, body);
     }
 
+    fn fetchWithCache(self: *App, web: *r4os.WebTransport, url: []const u8, raw: []u8, body: []u8, scratch: []u8, options: r4os.WebFetchOptions, mode: r4os.web_response_cache.Mode, partition: []const u8) response_cache.Result {
+        if (self.response_cache == null) self.response_cache = response_cache.Adapter.init(self.ctx.sys.allocator());
+        return self.response_cache.?.fetch(web, url, raw, body, scratch, .{
+            .transport = options,
+            .mode = mode,
+            .partition = partition,
+            .clock = .{ .context = self, .read = responseCacheClock },
+        });
+    }
+
+    fn responseCacheClock(raw: ?*anyopaque) r4os.web_response_cache.Clock {
+        const self: *App = @ptrCast(@alignCast(raw.?));
+        const unix = self.cacheNowSeconds();
+        return .{ .monotonic_ms = self.fontNowMilliseconds(), .unix_seconds = if (unix == 0) null else unix };
+    }
+
     fn fetchRuntimeRequest(
         self: *App,
         runtime: *r4os.web_runtime.WebRuntime,
@@ -3101,7 +3148,8 @@ const App = struct {
         raw_buffer: []u8,
         body_buffer: []u8,
     ) void {
-        const request_id = request.id;
+        var shared_ids: [r4os.web_runtime.max_requests]u32 = undefined;
+        const shared_count = runtime.joinResourceRequests(request, &shared_ids);
         const generation = request.generation;
         const request_kind = request.kind;
         const request_url = request.url;
@@ -3119,8 +3167,13 @@ const App = struct {
         };
         var origin_buffer: [r4os.web_security.max_origin_host_bytes + 24]u8 = undefined;
         const origin_header = runtime.security_context.document_origin.serialize(origin_buffer[0..]) orelse "null";
+        var partition_buffer: [512]u8 = undefined;
+        const partition = std.fmt.bufPrint(&partition_buffer, "opaque={d};mode={s};credentials={s}", .{
+            runtime.security_context.document_origin.opaque_id, @tagName(request.mode), @tagName(request.credentials),
+        }) catch unreachable;
         if (self.ctx.web) |*web| {
-            const result = web.fetch(
+            const cached = self.fetchWithCache(
+                web,
                 request_url.bytes(),
                 raw_buffer,
                 body_buffer,
@@ -3146,46 +3199,62 @@ const App = struct {
                     .target_authorizer = webRequestTargetAuthorizer,
                     .target_authorization_context = &authorization_context,
                 },
+                if (request.kind == .fetch or request.kind == .xhr or request.cache_mode != .normal) request.cache_mode else self.document_cache_mode,
+                partition,
             );
-            switch (result) {
-                .response => |response| {
-                    runtime.completeRequest(
-                        request_id,
-                        generation,
-                        .{
-                            .status = response.status,
-                            .secure = response.secure,
-                            .content_type = response.content_type orelse "",
-                            .content_security_policy = response.content_security_policy orelse "",
-                            .headers = response.headers,
-                            .redirected = response.redirects > 0,
-                            .final_url = response.final_url.bytes(),
-                            .access_control_allow_origin = response.access_control_allow_origin orelse "",
-                            .access_control_allow_credentials = response.access_control_allow_credentials,
-                            .set_cookies = response.set_cookies,
-                            .set_cookie_count = response.set_cookie_count,
-                            .manual_redirect = response.manual_redirect,
-                            .cookies_processed = true,
-                        },
-                        response.body,
-                    ) catch |err| {
-                        if (runtime == self.page_runtime and request_kind == .image) self.noteImageFailure(.other, @errorName(err), response.body.len);
-                        if (request_kind == .font) self.font_cache_failures += 1;
-                        if (err != error.CorsBlocked and err != error.StaleGeneration) self.setStatus(webRuntimeErrorText(err));
+            switch (cached.value) {
+                .response => |borrowed_response| {
+                    var snapshot: ?response_cache.Snapshot = null;
+                    defer if (snapshot) |*owned| owned.deinit();
+                    if (shared_count > 1) snapshot = response_cache.Snapshot.init(self.ctx.sys.allocator(), borrowed_response) catch {
+                        for (shared_ids[0..shared_count]) |id| if (runtime.requestInFlight(id, generation)) runtime.failRequest(id, generation, "Shared response memory unavailable") catch {};
+                        return;
                     };
+                    const response = if (snapshot) |owned| owned.response else borrowed_response;
+                    for (shared_ids[0..shared_count]) |request_id| {
+                        if (!runtime.requestInFlight(request_id, generation)) continue;
+                        runtime.completeRequest(
+                            request_id,
+                            generation,
+                            .{
+                                .status = response.status,
+                                .secure = response.secure,
+                                .content_type = response.content_type orelse "",
+                                .content_security_policy = response.content_security_policy orelse "",
+                                .headers = response.headers,
+                                .redirected = response.redirects > 0,
+                                .final_url = response.final_url.bytes(),
+                                .access_control_allow_origin = response.access_control_allow_origin orelse "",
+                                .access_control_allow_credentials = response.access_control_allow_credentials,
+                                .set_cookies = response.set_cookies,
+                                .set_cookie_count = response.set_cookie_count,
+                                .manual_redirect = response.manual_redirect,
+                                .cookies_processed = true,
+                                .response_identity = cached.response_identity,
+                            },
+                            response.body,
+                        ) catch |err| {
+                            if (runtime == self.page_runtime and request_kind == .image) self.noteImageFailure(.other, @errorName(err), response.body.len);
+                            if (request_kind == .font) self.font_cache_failures += 1;
+                            if (err != error.CorsBlocked and err != error.StaleGeneration) self.setStatus(webRuntimeErrorText(err));
+                        };
+                    }
                 },
                 .failure => |err| {
                     if (runtime == self.page_runtime and request_kind == .image) self.noteImageFailure(.fetch, fetchErrorText(err), 0);
                     if (request_kind == .font) self.font_cache_failures += 1;
-                    if (err == .policy_rejected)
-                        runtime.failRequestPolicy(request_id, generation, fetchErrorText(err)) catch {}
-                    else
-                        runtime.failRequest(request_id, generation, fetchErrorText(err)) catch {};
+                    for (shared_ids[0..shared_count]) |request_id| {
+                        if (!runtime.requestInFlight(request_id, generation)) continue;
+                        if (cached.only_cache_miss) runtime.failRequest(request_id, generation, "HTTP cache miss") catch {} else if (err == .policy_rejected)
+                            runtime.failRequestPolicy(request_id, generation, fetchErrorText(err)) catch {}
+                        else
+                            runtime.failRequest(request_id, generation, fetchErrorText(err)) catch {};
+                    }
                 },
             }
         } else {
             if (request_kind == .font) self.font_cache_failures += 1;
-            runtime.failRequest(request_id, generation, "Web transport unavailable") catch {};
+            for (shared_ids[0..shared_count]) |request_id| if (runtime.requestInFlight(request_id, generation)) runtime.failRequest(request_id, generation, "Web transport unavailable") catch {};
         }
     }
 

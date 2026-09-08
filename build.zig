@@ -152,8 +152,19 @@ pub fn build(b: *std.Build) void {
     const document_font_tests = b.addTest(.{ .root_module = document_font_module });
     const run_document_font_tests = b.addRunArtifact(document_font_tests);
     run_document_font_tests.setCwd(b.path("Tests/Fixture/Browser/Fonts06241"));
+    const response_cache_module = b.createModule(.{
+        .root_source_file = b.path("src/response_cache.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    response_cache_module.addImport("r4os", sdk.createR4osModule(b.graph.host, .Debug));
+    const response_cache_tests = b.addTest(.{ .root_module = response_cache_module, .filters = &.{ "cached transport", "shared response snapshot" } });
+    const run_response_cache_tests = b.addRunArtifact(response_cache_tests);
+    const response_cache_step = b.step("response-cache-test", "Run focused HTTP response cache tests");
+    response_cache_step.dependOn(&run_response_cache_tests.step);
     const test_step = b.step("test", "Run Klickifax navigation, inline SVG, storage and font source/cache tests");
     test_step.dependOn(&run_model_tests.step);
+    test_step.dependOn(&run_response_cache_tests.step);
     test_step.dependOn(&run_inline_svg_tests.step);
     test_step.dependOn(&run_storage_layout_tests.step);
     test_step.dependOn(&run_font_cache_store_tests.step);
