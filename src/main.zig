@@ -443,7 +443,7 @@ const App = struct {
                     },
                     .mouse_down => self.handleMouseDown(event.x, event.y),
                     .mouse_up => self.handleMouseUp(event.x, event.y),
-                    .key_down => self.handleKey(r4os.gui.eventKey(event)),
+                    .key_down => self.handleKey(r4os.gui.eventCodepoint(event)),
                     .font_changed => {
                         _ = self.refreshInstalledFonts();
                         self.render();
@@ -1599,7 +1599,8 @@ const App = struct {
         self.render();
     }
 
-    fn handleKey(self: *App, key: u8) void {
+    fn handleKey(self: *App, codepoint: u32) void {
+        const key: u8 = if (codepoint <= 0xff) @intCast(codepoint) else 0;
         if (key == r4os.gui.Key.escape) {
             if (self.loading_view_active or self.loading or self.script_running) {
                 self.requestStop();
@@ -1636,7 +1637,7 @@ const App = struct {
             if (key == r4os.gui.Key.enter) {
                 self.navigate();
             } else {
-                _ = self.address.handleClipboardKey(&self.ctx.desk, key);
+                _ = self.address.handleClipboardCodepoint(&self.ctx.desk, codepoint);
             }
             self.render();
             return;
