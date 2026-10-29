@@ -428,6 +428,17 @@ const App = struct {
                     pending_mouse_move.note(event.x, event.y);
                     continue;
                 }
+                if (kind == .input_reset or kind == .focus_lost) {
+                    _ = pending_mouse_move.take();
+                    const repaint = self.pressed != null or self.active_node != r4os.html.none;
+                    self.pressed = null;
+                    if (self.active_node != r4os.html.none) {
+                        self.active_node = r4os.html.none;
+                        self.reflowDocument();
+                    }
+                    if (repaint) self.render();
+                    continue;
+                }
                 if (pending_mouse_move.take()) |move| self.handleMouseMove(move.x, move.y);
                 switch (kind) {
                     .close, .mouse_move => unreachable,
