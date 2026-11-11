@@ -205,3 +205,26 @@ entfernt Orphans, atomare Reste und danach leere Digestverzeichnisse.
 Der Cache besitzt eigene Alters-, Groessen- und LRU-Grenzen und beruehrt weder
 `C:\R4OS\FONTS\` noch den persistenten R4DRAW-Systemfontkatalog. Diese Stufe
 installiert oder aktiviert noch keine Webschrift und startet FONTS.R4X nicht.
+
+Fortschreibung 0.90.75 - App2 und Browserbesitz
+-----------------------------------------------
+Klickifax0.29.27 verwendet SDK208, App2 und Query2. R4FONT, R4IMG und
+R4STD binden ihre eigenstaendigen Runtimeinterfaces ueber init2. Argumente
+werden mit ihrer ganzen Startlaenge gelesen. Die GUI nutzt den gemeinsamen
+EventLoop mit endlicher Seitenarbeitsfrist und coalescierten Mausbewegungen.
+Adressediting verwendet gemessene SDK-Textcontrols, typisierte UTF8-Angebote
+und einen eigenen Kompositionszustand mit Fokus-/Revisionsinvalidierung.
+Paste prueft ganze Laenge und Kapazitaet vor einer Mutation. Formularinput
+uebernimmt ganze Unicode-Skalare. Der vorhandene Kompositionsanbieter wird
+wirklich abgefragt und sein genauer Status bleibt gespeichert.
+
+Profil-/Legacyreads und Fontcachekandidaten verwenden weite Metadaten und
+die validierte Snapshotgroesse. Profile werden ueber DocumentSave atomar
+publiziert. Legacy-Retirement verlangt Publikationsquittung und ganzes
+Readback. Fontobjektpruefungen halten eine Gesamtfrist, ganze Quelle, EOF
+und bescheinigte Identitaet/Revision bis zur Hashfreigabe. Webjobs behalten
+ihre Request-/Dokumentgenerationen, Speicher und Ownercallbacks bis zum
+tatsaechlichen Join. ResourceWaits verwenden die gemeinsame Clockbudget-
+implementierung. JavaScript-/Fontzeit stammt aus validierten Nanosekunden.
+Die Abnahmen und Originale stehen unter API/ConsumerMigration.txt im Docs-
+Repository und Research/API-ABI/Migration/0.90.75 im lokalen Workspace.

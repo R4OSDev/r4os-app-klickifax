@@ -207,6 +207,22 @@ fn internalName(value: []const u8) []const u8 {
     return value[0..end];
 }
 
+pub fn formCodepoint(codepoint: u32, output: *[4]u8) ?[]const u8 {
+    if (codepoint < 0x20 or (codepoint >= 0x7f and codepoint < 0xa0) or codepoint > 0x10ffff) return null;
+    const count = std.unicode.utf8Encode(@intCast(codepoint), output) catch return null;
+    return output[0..count];
+}
+
+test "form input keeps complete Unicode scalars and rejects control and invalid codepoints" {
+    var output: [4]u8 = undefined;
+    try std.testing.expectEqualStrings("A", formCodepoint('A', &output).?);
+    try std.testing.expectEqualStrings("€", formCodepoint(0x20ac, &output).?);
+    try std.testing.expectEqualStrings("😀", formCodepoint(0x1f600, &output).?);
+    try std.testing.expect(formCodepoint(0x88, &output) == null);
+    try std.testing.expect(formCodepoint(0xd800, &output) == null);
+    try std.testing.expect(formCodepoint(0x110000, &output) == null);
+}
+
 test "browser raster plan uses R4DRAW scale without exceeding its payload" {
     const eiffel = planRaster(136, 200, abi.gui_raster_max_pixels).?;
     try std.testing.expectEqual(@as(u32, 68), eiffel.width);

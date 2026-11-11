@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.29.7`
+- Version: `0.29.27`
 - Image target: `/R4OS/SOFTWARE/INTERNET/KLICKIFAX.R4X`
 - Image scope: `none` (on-demand)
 - Canonical project manifest: `module.R4MF`
@@ -18,7 +18,7 @@ On Windows:
 
     Build.bat
 
-On Linux or macOS:
+On Linux:
 
     ./Build.sh
 
@@ -28,10 +28,10 @@ changes to Klickifax, KlickifaxLive, or their browser protocol chain, run
 workspace root. That explicit path runs the repository tests and includes the
 browser bundle in the headless Test image.
 
-The build starters resolve the current local R4OS dependency checkouts through
-`Settings.R4S`. The URL and hash entries in `build.zig.zon` record the
-last verified standalone dependency identities; workspace builds use the
-mapped local checkouts.
+`Settings.R4S` selects the SDK tool owner. Its profiles define the verified
+SDK, Contract and system library sources. `build.zig.zon` records the exact
+standalone archive identities. The shared PowerShell build path binds the
+actual selected sources and records its normal or explicit development mode.
 
 ## Documentation
 
@@ -48,3 +48,5 @@ and `NOTICE`. Any repository-specific external material is documented in
 0.85.44: Rebuilt with SDK0.64.57 and the shared R4STD Unicode17.0.0
 extended grapheme editing boundaries. Byte offsets, scalar font advances
 and grapheme clusters are distinct; no shaping or BiDi support is implied.
+
+API migration0.90.75 uses SDK0.64.208 with `r4os-zig-generation2`.

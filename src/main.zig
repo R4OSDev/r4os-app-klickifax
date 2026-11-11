@@ -16,6 +16,7 @@ const loading_view = @import("loading_view.zig");
 const native_paint = @import("native_paint.zig");
 
 const AppApi = struct {
+    app: *const r4os.App2,
     sys: r4os.r4sys.Context,
     desk: r4os.r4desk.Context,
     draw: r4os.r4draw.Context,
@@ -25,13 +26,14 @@ const AppApi = struct {
     files: r4os.Files,
     web: ?r4os.WebTransport,
 
-    fn init(r4_app: *r4os.App) ?AppApi {
+    fn init(r4_app: *r4os.App2) ?AppApi {
         return .{
+            .app = r4_app,
             .sys = r4_app.system(),
             .desk = r4_app.desktop() orelse return null,
             .draw = r4_app.drawing() orelse return null,
-            .font = r4font.Context.init(r4_app.startContext()) orelse return null,
-            .image = r4img.Context.init(r4_app.startContext()) orelse return null,
+            .font = r4font.Context.init2(r4_app.startContext()) orelse return null,
+            .image = r4img.Context.init2(r4_app.startContext()) orelse return null,
             .dev = r4_app.devicesLowLevel() orelse return null,
             .files = r4_app.files() orelse return null,
             .web = r4_app.web(),
@@ -225,10 +227,10 @@ const TransportBuffers = struct {
     rollback_browser: model.Browser,
 };
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
-    if (!r4std.init(r4_app.startContext())) return r4os.abi.err_no_group;
+pub fn r4_app_main(r4_app: *r4os.App2) i32 {
+    if (!r4std.init2(r4_app.startContext())) return r4os.abi.err_no_group;
     var ctx = AppApi.init(r4_app) orelse return r4os.abi.err_no_group;
-    if (hasArg(ctx.sys.argsRaw(), "/SELFTEST")) return runSelfTest(&ctx);
+    if (hasArg(r4_app.args(), "/SELFTEST")) return runSelfTest(&ctx);
     const allocator = ctx.sys.allocator();
     var font_store = app_fonts.FaceStore.init(ctx.font, allocator, .{}) catch return -1;
     defer font_store.deinit();
@@ -268,6 +270,10 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
     defer if (app.response_cache) |*cache| cache.deinit();
     defer app.navigation_sessions.deinit();
     defer app.deinitResourceJobs();
+    defer _ = app.clipboard.close();
+    defer if (app.composition_client) |*client| {
+        _ = client.close();
+    };
     const result = app.run();
     if (app.web_state_initialized) saveBrowserStorage(&ctx.files, browser_storage, persistence_buffer);
     return result;
@@ -283,6 +289,12 @@ const App = struct {
     ctx: *AppApi,
     browser: model.Browser,
     address: r4os.gui.TextField(model.url_capacity + 1) = .{},
+    clipboard: r4os.gui.TextClipboard = .{},
+    clipboard_status: i32 = 0,
+    composition: r4os.text_composition.Owner = .{ .owner_generation = 1 },
+    composition_client: ?r4os.text_composition_client.Client = null,
+    composition_status: i32 = r4os.abi.composition_error_unsupported,
+    text_revision: u64 = 1,
     focus: FocusTarget = .address,
     pressed: ?FocusTarget = null,
     w: i32 = 720,
@@ -416,12 +428,21 @@ const App = struct {
         _ = self.loadFonts();
         self.render();
         self.initializeWebState();
+        self.probeComposition();
 
+        var events = r4os.EventLoop.init(self.ctx.sys, self.ctx.desk, &.{});
+        var next_event: ?r4os.abi.GuiEvent = null;
         while (!self.ctx.sys.programShouldClose() and !self.should_exit) {
             if (self.refreshInstalledFonts()) self.render();
-            var event: r4os.abi.GuiEvent = .{};
             var pending_mouse_move = PendingMouseMove{};
-            while (self.ctx.desk.guiPollEvent(&event) > 0) {
+            while (true) {
+                const event = if (next_event) |value| block: {
+                    next_event = null;
+                    break :block value;
+                } else block: {
+                    const message = events.poll() orelse break;
+                    break :block message.guiEvent() orelse continue;
+                };
                 const kind: r4os.abi.GuiEventKind = @enumFromInt(event.kind);
                 if (kind == .close) return 0;
                 if (kind == .mouse_move) {
@@ -429,6 +450,7 @@ const App = struct {
                     continue;
                 }
                 if (kind == .input_reset or kind == .focus_lost) {
+                    self.invalidateComposition();
                     _ = pending_mouse_move.take();
                     const repaint = self.pressed != null or self.active_node != r4os.html.none;
                     self.pressed = null;
@@ -443,6 +465,7 @@ const App = struct {
                 switch (kind) {
                     .close, .mouse_move => unreachable,
                     .resize => {
+                        self.invalidateComposition();
                         const previous_w = self.w;
                         const previous_h = self.h;
                         self.updateMetrics();
@@ -456,6 +479,7 @@ const App = struct {
                     .mouse_up => self.handleMouseUp(event.x, event.y),
                     .key_down => self.handleKey(r4os.gui.eventCodepoint(event)),
                     .font_changed => {
+                        self.invalidateComposition();
                         _ = self.refreshInstalledFonts();
                         self.render();
                     },
@@ -469,7 +493,11 @@ const App = struct {
             }
             self.pumpPageRuntime();
             const sleep_ms = pageLoopSleepMilliseconds(self.runtime_active, self.loading, self.page_runtime.resourcesSettled());
-            self.ctx.sys.sleepTicks(self.ctx.sys.ticksFromMilliseconds(sleep_ms));
+            switch (events.wait(r4os.time_contract.timeoutFinite(.{ .nanoseconds = sleep_ms * 1_000_000 }))) {
+                .message => |message| next_event = message.guiEvent(),
+                .timed_out => {},
+                .failure => |code| return code,
+            }
         }
         return 0;
     }
@@ -1544,6 +1572,7 @@ const App = struct {
     }
 
     fn handleMouseDown(self: *App, x: i32, y: i32) void {
+        self.invalidateComposition();
         const page = self.documentRect().inset(2, 2);
         const scrollbar = self.documentScrollbar(page);
         const scrollbar_part = scrollbar.partAt(x, y);
@@ -1610,6 +1639,96 @@ const App = struct {
         self.render();
     }
 
+    fn invalidateComposition(self: *App) void {
+        _ = self.composition.cancel(self.composition.id);
+        self.text_revision +|= 1;
+    }
+
+    fn probeComposition(self: *App) void {
+        var client: r4os.text_composition_client.Client = undefined;
+        self.composition_status = self.ctx.app.compositionClient(self.ctx.sys.ticksFromMilliseconds(500), &client);
+        if (self.composition_status != 0) return;
+        self.composition_client = client;
+        const bound = &self.composition_client.?;
+        var capability: r4os.abi.CompositionCapabilityReply = .{};
+        self.composition_status = bound.capability(&capability);
+        if (self.composition_status != 0) return;
+        var focus: r4os.abi.CompositionFocus = .{};
+        if (r4os.text_composition.providerStatus(capability.provider) == 0) {
+            var process: r4os.abi.ProgramProcessHandle = .{};
+            self.composition_status = self.ctx.sys.programOpenHandle(@intCast(self.ctx.app.startContext().instance_id), &process);
+            if (self.composition_status != 0) return;
+            const window_id = self.ctx.desk.programWindowId();
+            if (window_id < 0) {
+                self.composition_status = r4os.abi.composition_error_no_focus;
+                return;
+            }
+            var window = r4os.window_mode.Client{ .owner = process, .window_id = @intCast(window_id) };
+            if (!window.poll(&self.ctx.sys)) {
+                self.composition_status = window.last_error;
+                return;
+            }
+            var reply: r4os.abi.CompositionFocusReply = .{};
+            self.composition_status = bound.focus(&window.state.identity, &reply);
+            if (self.composition_status != 0) return;
+            if (reply.result != 0) {
+                self.composition_status = reply.result;
+                return;
+            }
+            focus = reply.focus;
+        }
+        var id: r4os.text_composition.Id = undefined;
+        self.composition_status = self.address.beginComposition(&self.composition, &focus, &capability.provider, self.text_revision, &r4os.abi.CompositionCaret{}, &id);
+    }
+
+    fn handleAddressKey(self: *App, codepoint: u32) bool {
+        if (codepoint != r4os.gui.Key.ctrl_c and codepoint != r4os.gui.Key.ctrl_x and codepoint != r4os.gui.Key.ctrl_v) {
+            self.invalidateComposition();
+            return self.address.handleCodepointChecked(codepoint);
+        }
+        self.clipboard_status = self.clipboard.connect(&self.ctx.sys);
+        if (self.clipboard_status != 0) {
+            self.setStatus("Clipboard operation failed.");
+            return false;
+        }
+        const range = self.address.selectionRange();
+        if (codepoint == r4os.gui.Key.ctrl_c or codepoint == r4os.gui.Key.ctrl_x) {
+            const selected = if (self.address.hasSelection()) self.address.value()[range.start..range.end] else self.address.value();
+            self.clipboard_status = self.clipboard.copy(selected);
+            if (self.clipboard_status != 0) {
+                self.setStatus("Clipboard operation failed.");
+                return false;
+            }
+            if (codepoint == r4os.gui.Key.ctrl_c) return false;
+            self.invalidateComposition();
+            if (self.address.hasSelection()) return self.address.handleKey(r4os.gui.Key.delete);
+            self.address.clear();
+            return true;
+        }
+        var scratch: [model.url_capacity + 1]u8 = undefined;
+        var count: usize = 0;
+        self.clipboard_status = self.clipboard.read(&scratch, &count);
+        if (self.clipboard_status != 0) {
+            self.setStatus("Clipboard operation failed.");
+            return false;
+        }
+        const capacity = self.address.buffer.len - 1 - self.address.len + range.end - range.start;
+        if (count > capacity) {
+            self.clipboard_status = r4os.abi.clipboard_offer_error_too_large;
+            self.setStatus("The clipboard text exceeds the address capacity.");
+            return false;
+        }
+        for (scratch[0..count]) |byte| {
+            if (byte < 0x20 or byte == 0x7f) {
+                self.clipboard_status = r4os.abi.clipboard_offer_error_invalid;
+                self.setStatus("The clipboard text contains a control character.");
+                return false;
+            }
+        }
+        self.invalidateComposition();
+        return self.address.pasteSlice(scratch[0..count]);
+    }
+
     fn handleKey(self: *App, codepoint: u32) void {
         const key: u8 = if (codepoint <= 0xff) @intCast(codepoint) else 0;
         if (key == r4os.gui.Key.escape) {
@@ -1621,6 +1740,7 @@ const App = struct {
             return;
         }
         if (key == ctrl_l) {
+            self.invalidateComposition();
             self.focus = .address;
             self.address.selectAll();
             self.setStatus("Enter an address and press Enter.");
@@ -1633,6 +1753,7 @@ const App = struct {
             return;
         }
         if (key == r4os.gui.Key.tab or key == r4os.gui.Key.shift_tab) {
+            self.invalidateComposition();
             if (self.focus == .document and self.loaded_html and
                 self.transport.interaction.focusNext(key == r4os.gui.Key.shift_tab))
             {
@@ -1648,13 +1769,13 @@ const App = struct {
             if (key == r4os.gui.Key.enter) {
                 self.navigate();
             } else {
-                _ = self.address.handleClipboardCodepoint(&self.ctx.desk, codepoint);
+                _ = self.handleAddressKey(codepoint);
             }
             self.render();
             return;
         }
         if (self.focus == .document) {
-            if (self.handleFormKey(key)) {
+            if (self.handleFormKey(codepoint)) {
                 if (!self.should_exit) self.render();
                 return;
             }
@@ -1704,6 +1825,7 @@ const App = struct {
     }
 
     fn loadCurrent(self: *App, local_status: []const u8) void {
+        self.invalidateComposition();
         self.address.set(self.browser.currentUrl().bytes());
         self.setStatus(local_status);
         self.updateTitle();
@@ -1902,15 +2024,23 @@ const App = struct {
                 self.setStatus(webRuntimeErrorText(err));
                 return false;
             };
-            const resource_deadline = self.ctx.sys.ticks() +| self.ctx.sys.ticksFromMilliseconds(30_000);
-            while (!self.documentResourcesSettled() and self.ctx.sys.ticks() < resource_deadline) {
+            const resource_clock = self.ctx.app.clock() catch {
+                self.setStatus("The resource clock is unavailable.");
+                return false;
+            };
+            var resource_budget = r4os.rpc_budget.Budget.fromTimeout(resource_clock.read, r4os.time_contract.timeoutFinite(.{ .nanoseconds = 30_000_000_000 })) catch {
+                self.setStatus("The resource deadline is unavailable.");
+                return false;
+            };
+            while (!self.documentResourcesSettled()) {
+                _ = resource_budget.remainingTicks() catch break;
                 self.servicePageRequestsBurst();
                 if (!webProgress(self)) break;
                 self.ctx.sys.sleepTicks(1);
             }
             if (!self.documentResourcesSettled()) {
                 self.deinitResourceJobs();
-                self.setStatus("The document resource queue did not settle before its deadline.");
+                self.setStatus("The document resource wait failed or expired.");
                 return false;
             }
             if (!self.rebuildWebFontRegistry()) return false;
@@ -2722,7 +2852,8 @@ const App = struct {
         };
     }
 
-    fn handleFormKey(self: *App, key: u8) bool {
+    fn handleFormKey(self: *App, codepoint: u32) bool {
+        const key: u8 = if (codepoint <= 0xff) @intCast(codepoint) else 0;
         const focused_node = self.transport.interaction.focused_node;
         if (focused_node == r4os.html.none) return false;
         const control = self.transport.interaction.focusedControl() orelse {
@@ -2772,9 +2903,10 @@ const App = struct {
             r4os.gui.Key.end => return self.transport.interaction.moveCursor(.end),
             else => {},
         }
-        if (key >= 0x20 and key < 0x7F and (control.kind == .text or control.kind == .search)) {
-            const input = [_]u8{key};
-            return self.transport.interaction.insertText(input[0..]) catch |err| {
+        if (control.kind == .text or control.kind == .search) {
+            var input: [4]u8 = undefined;
+            const bytes = model.formCodepoint(codepoint, &input) orelse return false;
+            return self.transport.interaction.insertText(bytes) catch |err| {
                 self.setStatus(formErrorText(err));
                 return true;
             };
@@ -2974,6 +3106,7 @@ const App = struct {
 
     fn restoreRollback(self: *App) void {
         if (!self.has_rollback) return;
+        self.invalidateComposition();
         self.browser = self.transport.rollback_browser;
         self.has_rollback = false;
         self.address.set(self.browser.currentUrl().bytes());
@@ -2981,6 +3114,7 @@ const App = struct {
     }
 
     fn requestStop(self: *App) void {
+        self.invalidateComposition();
         @atomicStore(u32, &self.stop_flag.value, 1, .release);
         self.setStatus("Stopping...");
     }
@@ -3358,9 +3492,8 @@ const App = struct {
     }
 
     fn nowMilliseconds(self: *const App) f64 {
-        const frequency = self.ctx.sys.monotonicHz();
-        if (frequency == 0) return @floatFromInt(self.ctx.sys.ticks());
-        return @as(f64, @floatFromInt(self.ctx.sys.ticks())) * 1000.0 / @as(f64, @floatFromInt(frequency));
+        const sample = self.ctx.sys.base.clockSampleChecked() catch return 0;
+        return @as(f64, @floatFromInt(sample.instant_ns)) / 1_000_000.0;
     }
 
     fn fontNowMilliseconds(self: *const App) u64 {
@@ -4327,58 +4460,48 @@ fn ensureBrowserDataLayout(files: *const r4os.Files) void {
     _ = files.write(settings_path.asZ(), writer.bytes());
 }
 
-fn loadStorageFile(files: *const r4os.Files, path_text: []const u8, storage: *r4os.web_security.BrowserStorage, buffer: []u8) bool {
-    const path = r4os.AbsoluteFilePath.parse(path_text) catch return false;
-    switch (files.read(path.asZ(), buffer)) {
-        .bytes => |count| {
-            storage.decode(buffer[0..count]) catch {
-                storage.reset();
-                return false;
-            };
-            return true;
-        },
-        .end, .failure => return false,
-    }
+fn readStorageFile(files: *const r4os.Files, path_text: []const u8, buffer: []u8) ?usize {
+    const path = r4os.AbsoluteFilePath.parse(path_text) catch return null;
+    const value = switch (files.readDocumentPrefix(path.asZ(), buffer, r4os.time_contract.timeoutFinite(.{ .nanoseconds = 5_000_000_000 }))) {
+        .value => |value| value,
+        .failure => return null,
+    };
+    if (value.file_size != value.bytes) return null;
+    return value.bytes;
 }
 
-fn transferByteCount(transfer: r4os.app_storage.Transfer) ?usize {
-    return switch (transfer) {
-        .bytes => |count| count,
-        .end, .failure => null,
+fn loadStorageFile(files: *const r4os.Files, path_text: []const u8, storage: *r4os.web_security.BrowserStorage, buffer: []u8) ?usize {
+    const count = readStorageFile(files, path_text, buffer) orelse return null;
+    storage.decode(buffer[0..count]) catch {
+        storage.reset();
+        return null;
     };
+    return count;
 }
 
 fn migrateLegacyBrowserStorage(files: *const r4os.Files, allocator: std.mem.Allocator, source: []const u8) void {
     const profile_path = r4os.AbsoluteFilePath.parse(storage_layout.profile_storage_path) catch return;
     const legacy_path = r4os.AbsoluteFilePath.parse(storage_layout.legacy_storage_path) catch return;
-    const written = transferByteCount(files.write(profile_path.asZ(), source));
+    var saver: r4os.document_save.Saver = .{};
+    if (!saver.save(files.*, profile_path.asZ(), source, false).committed()) return;
     const verify_buffer = allocator.alloc(u8, source.len) catch return;
     defer allocator.free(verify_buffer);
-    const verified = switch (files.read(profile_path.asZ(), verify_buffer)) {
-        .bytes => |count| verify_buffer[0..count],
-        .end, .failure => null,
-    };
-    if (storage_layout.migrationVerified(source, written, verified)) _ = files.delete(legacy_path.asZ());
+    const verified_count = readStorageFile(files, storage_layout.profile_storage_path, verify_buffer) orelse return;
+    if (storage_layout.migrationVerified(source, source.len, verify_buffer[0..verified_count])) _ = files.delete(legacy_path.asZ());
 }
 
 fn loadBrowserStorage(files: *const r4os.Files, allocator: std.mem.Allocator, storage: *r4os.web_security.BrowserStorage, buffer: []u8) void {
-    const profile_valid = loadStorageFile(files, storage_layout.profile_storage_path, storage, buffer);
-    if (storage_layout.chooseLoadSource(profile_valid, false) == .profile) return;
+    if (loadStorageFile(files, storage_layout.profile_storage_path, storage, buffer) != null) return;
     storage.reset();
-    const legacy_valid = loadStorageFile(files, storage_layout.legacy_storage_path, storage, buffer);
-    if (storage_layout.chooseLoadSource(false, legacy_valid) != .legacy) return;
-    const legacy_path = r4os.AbsoluteFilePath.parse(storage_layout.legacy_storage_path) catch return;
-    const count = switch (files.read(legacy_path.asZ(), buffer)) {
-        .bytes => |value| value,
-        .end, .failure => return,
-    };
+    const count = loadStorageFile(files, storage_layout.legacy_storage_path, storage, buffer) orelse return;
     migrateLegacyBrowserStorage(files, allocator, buffer[0..count]);
 }
 
 fn saveBrowserStorage(files: *const r4os.Files, storage: *const r4os.web_security.BrowserStorage, buffer: []u8) void {
     const path = r4os.AbsoluteFilePath.parse(storage_layout.profile_storage_path) catch return;
     const bytes = storage.encode(buffer) catch return;
-    _ = files.write(path.asZ(), bytes);
+    var saver: r4os.document_save.Saver = .{};
+    _ = saver.save(files.*, path.asZ(), bytes, false);
 }
 
 fn localSearchFixture() []const u8 {
@@ -5284,9 +5407,8 @@ fn startsWith(value: []const u8, prefix: []const u8) bool {
     return value.len >= prefix.len and equals(value[0..prefix.len], prefix);
 }
 
-fn hasArg(args: [*:0]const u8, wanted: []const u8) bool {
-    const bytes = spanPtrZ(args);
-    var rest = bytes;
+fn hasArg(args: []const u8, wanted: []const u8) bool {
+    var rest = args;
     while (rest.len > 0) {
         while (rest.len > 0 and (rest[0] == ' ' or rest[0] == '\t')) rest = rest[1..];
         if (rest.len == 0) break;

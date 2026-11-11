@@ -955,14 +955,15 @@ pub const Store = struct {
     fn readPersistentState(self: *Store, output: *State) Error!bool {
         self.read_stats.catalog_reads +|= 1;
         const path = absolute(cache.catalog_path) catch return error.BadPath;
-        const info = switch (self.files.info(path.asZ())) {
-            .value => |value| value,
+        const info = switch (self.files.metadata(path.asZ())) {
+            .found => |value| value,
             .missing => return false,
             .failure => return error.Io,
         };
-        if (info.is_dir != 0) return error.CatalogCorrupt;
-        if (info.size > max_catalog_bytes) return error.CatalogTooLarge;
-        const bytes = try self.allocator.alloc(u8, @intCast(info.size));
+        if (info.flags & r4os.abi.file_metadata2_flag_directory != 0) return error.CatalogCorrupt;
+        const size = r4os.metadata2.fileSize(&info) orelse return error.CatalogCorrupt;
+        if (size > max_catalog_bytes) return error.CatalogTooLarge;
+        const bytes = try self.allocator.alloc(u8, @intCast(size));
         defer self.allocator.free(bytes);
         try self.readExact(path, bytes);
         output.* = try decodeState(bytes, self.policy);
@@ -1129,30 +1130,50 @@ pub const Store = struct {
     fn observe(self: *Store, path: r4os.AbsoluteFilePath, scratch: []u8) Error!Observation {
         self.read_stats.object_reads +|= 1;
         if (scratch.len == 0) return error.BufferTooSmall;
-        const info = switch (self.files.info(path.asZ())) {
-            .value => |value| value,
+        const context = self.files.sys.base.generation2 orelse return error.Io;
+        var clock = r4os.stream_transfer.adapters.PlatformClock.fromContext2(context) catch return error.Io;
+        var budget = r4os.rpc_budget.Budget.fromTimeout(clock.read, r4os.time_contract.timeoutFinite(.{ .nanoseconds = 5_000_000_000 })) catch return error.Io;
+        const info = switch (self.files.metadata(path.asZ())) {
+            .found => |value| value,
             .missing => return error.ObjectMissing,
             .failure => return error.Io,
         };
-        if (info.is_dir != 0 or info.size > 0xFFFF_FFFF) return error.ObjectCorrupt;
+        const size = r4os.metadata2.fileSize(&info) orelse return error.ObjectCorrupt;
+        if (info.flags & r4os.abi.file_metadata2_flag_directory != 0 or size > 0xFFFF_FFFF) return error.ObjectCorrupt;
+        const driver = r4os.stream_transfer.adapters.Driver{ .sys = self.files.sys, .clock = &clock, .budget = &budget };
+        var source = r4os.stream_transfer.adapters.FileRead.fromContext2(context, path.asZ().ptr, 0) catch return error.Io;
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         var offset: u64 = 0;
-        while (offset < info.size) {
-            const want: usize = @intCast(@min(@as(u64, scratch.len), info.size - offset));
-            const got = switch (self.files.readAt(path.asZ(), @intCast(offset), scratch[0..want])) {
-                .bytes => |count| @as(usize, count),
-                .end => return error.ObjectCorrupt,
-                .failure => return error.Io,
-            };
-            if (got == 0 or got > want) return error.ObjectCorrupt;
+        while (offset < size) {
+            const want: usize = @intCast(@min(@as(u64, scratch.len), size - offset));
+            source.base_offset = offset;
+            const progress = driver.read(scratch[0..want], io_chunk_bytes, r4os.stream_transfer.adapters.FileRead.step, &source, true) catch return error.Io;
+            if (progress.outcome != @intFromEnum(r4os.stream_transfer.Outcome.complete) or progress.bytes != want) return error.ObjectCorrupt;
+            const got = progress.bytes;
             hasher.update(scratch[0..got]);
             self.read_stats.object_read_bytes +|= got;
             self.read_stats.object_hash_bytes +|= got;
             offset += got;
         }
+        source.base_offset = size;
+        var lookahead: [1]u8 = undefined;
+        const tail = driver.read(&lookahead, 1, r4os.stream_transfer.adapters.FileRead.step, &source, true) catch return error.Io;
+        if (tail.outcome != @intFromEnum(r4os.stream_transfer.Outcome.eof) or tail.bytes != 0) return error.ObjectCorrupt;
+        const after = switch (self.files.metadata(path.asZ())) {
+            .found => |value| value,
+            else => return error.Io,
+        };
+        _ = budget.remainingTicks() catch return error.Io;
+        if (r4os.metadata2.fileSize(&after) != size or after.flags & r4os.abi.file_metadata2_flag_directory != 0) return error.ObjectCorrupt;
+        if (r4os.metadata2.identity(&info)) |identity| {
+            const current = r4os.metadata2.identity(&after) orelse return error.ObjectCorrupt;
+            if (!std.meta.eql(identity.*, current.*)) return error.ObjectCorrupt;
+        }
+        if (info.flags & r4os.abi.file_metadata2_flag_content_revision_valid != 0 and
+            (after.flags & r4os.abi.file_metadata2_flag_content_revision_valid == 0 or info.content_revision != after.content_revision)) return error.ObjectCorrupt;
         var digest: cache.Digest = undefined;
         hasher.final(&digest);
-        return .{ .size = info.size, .digest = digest };
+        return .{ .size = size, .digest = digest };
     }
 
     fn readExact(self: *Store, path: r4os.AbsoluteFilePath, output: []u8) Error!void {
@@ -1161,24 +1182,13 @@ pub const Store = struct {
 
     fn readExactCounted(self: *Store, path: r4os.AbsoluteFilePath, output: []u8, count_object: bool) Error!void {
         if (count_object) self.read_stats.object_reads +|= 1;
-        const info = switch (self.files.info(path.asZ())) {
+        var empty: [1]u8 = undefined;
+        const value = switch (self.files.readDocumentPrefix(path.asZ(), if (output.len == 0) &empty else output, r4os.time_contract.timeoutFinite(.{ .nanoseconds = 5_000_000_000 }))) {
             .value => |value| value,
-            .missing => return error.ObjectMissing,
-            .failure => return error.Io,
+            .failure => |code| return if (code == r4os.abi.file_stream_error_not_found) error.ObjectMissing else error.Io,
         };
-        if (info.is_dir != 0 or info.size != output.len or info.size > 0xFFFF_FFFF) return error.ObjectCorrupt;
-        var offset: usize = 0;
-        while (offset < output.len) {
-            const end = @min(offset + io_chunk_bytes, output.len);
-            const got = switch (self.files.readAt(path.asZ(), @intCast(offset), output[offset..end])) {
-                .bytes => |count| @as(usize, count),
-                .end => return error.ObjectCorrupt,
-                .failure => return error.Io,
-            };
-            if (got == 0 or offset + got > end) return error.ObjectCorrupt;
-            if (count_object) self.read_stats.object_read_bytes +|= got;
-            offset += got;
-        }
+        if (value.file_size != output.len or value.bytes != output.len) return error.ObjectCorrupt;
+        if (count_object) self.read_stats.object_read_bytes +|= value.bytes;
     }
 
     fn removeOrphanObjects(self: *Store, state: *const State) Error!usize {
@@ -2530,20 +2540,30 @@ const WarmReadFixture = struct {
     leases: usize = 0,
     object_bytes: usize = 0,
     catalog_bytes: usize = 0,
+    clock_ns: u64 = 0,
 
     fn contents(self: *@This(), path: []const u8) ?[]const u8 {
         if (std.ascii.eqlIgnoreCase(path, cache.catalog_path)) return self.catalog;
         if (std.ascii.eqlIgnoreCase(path, self.object_path.bytes())) return self.object;
         return null;
     }
-    fn info(path: [*:0]const u8, out: *r4os.abi.FileInfo) callconv(.c) i32 {
+    fn info(path: [*:0]const u8, out: *r4os.abi.FileMetadata2) callconv(.c) i32 {
         const self = current.?;
         std.debug.assert(self.leased);
         out.* = .{};
         const bytes = self.contents(std.mem.span(path)) orelse return 0;
-        out.exists = 1;
-        out.size = bytes.len;
+        out.* = .{ .byte_size = bytes.len, .content_revision = 1, .flags = r4os.abi.file_metadata2_flag_exists | r4os.abi.file_metadata2_flag_byte_size_valid |
+            r4os.abi.file_metadata2_flag_identity_valid | r4os.abi.file_metadata2_flag_content_revision_valid, .identity = .{ .mount_slot = 1, .mount_generation = 1, .namespace_generation = 1, .object_lo = if (std.ascii.eqlIgnoreCase(std.mem.span(path), cache.catalog_path)) 1 else 2 } };
         return 1;
+    }
+    fn clock(out: *r4os.abi.MonotonicClockInfo) callconv(.c) i32 {
+        const self = current.?;
+        self.clock_ns += 1000;
+        out.* = .{ .instant_ns = self.clock_ns, .flags = r4os.abi.monotonic_clock_flag_valid, .source = 1, .generation = 1, .resolution_ns = 1, .event_requested_hz = 1000 };
+        return 1;
+    }
+    fn shouldClose(_: *const r4os.platform2.abi.R4XStartContext2) callconv(.c) u32 {
+        return 0;
     }
     fn read(path: [*:0]const u8, offset: u32, output: [*]u8, capacity: u32) callconv(.c) i32 {
         const self = current.?;
@@ -2593,14 +2613,17 @@ test "selected warm load reads and hashes once and keeps a replaced object snaps
     var fixture: WarmReadFixture = .{ .catalog = catalog_bytes, .object = bytes, .object_path = try cache.objectPath(prepared.metadata.id) };
     WarmReadFixture.current = &fixture;
     defer WarmReadFixture.current = null;
-    var table: r4os.abi.R4XStartR4Sys = .{
-        .file_info = @intFromPtr(&WarmReadFixture.info),
+    var table: r4os.platform2.abi.R4XStartR4Sys2 = .{
+        .file_metadata2 = @intFromPtr(&WarmReadFixture.info),
+        .monotonic_clock = @intFromPtr(&WarmReadFixture.clock),
         .file_read_at = @intFromPtr(&WarmReadFixture.read),
         .file_stream_begin = @intFromPtr(&WarmReadFixture.begin),
         .file_stream_abort = @intFromPtr(&WarmReadFixture.abort),
     };
-    var bundle: r4os.program.Bundle = .{ .raw = undefined, .sys = &table };
-    var store = try Store.init(allocator, .{ .sys = r4os.r4sys.Context.init(&bundle) }, .{});
+    var imports = [_]r4os.abi.R4XStartImport{.{ .group_id = 1, .resolved_version = 2, .table = @intFromPtr(&table) }};
+    var start: r4os.platform2.abi.R4XStartContext2 = .{ .imports = @intFromPtr(&imports), .import_count = imports.len, .flags = r4os.abi.r4xstart_flag_close_supported, .should_close = @intFromPtr(&WarmReadFixture.shouldClose) };
+    const context = try r4os.platform2.Context.init(&start);
+    var store = try Store.init(allocator, .{ .sys = r4os.r4sys.Context.fromProgram(.{ .generation2 = &context }) }, .{});
     defer store.deinit();
     store.loaded = true;
     var loaded = (try store.loadSelected(allocator, origin, source, .truetype, 0, 1)).?;
