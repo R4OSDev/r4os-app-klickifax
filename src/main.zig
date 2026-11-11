@@ -271,8 +271,8 @@ pub fn r4_app_main(r4_app: *r4os.App2) i32 {
     defer app.navigation_sessions.deinit();
     defer app.deinitResourceJobs();
     defer _ = app.clipboard.close();
-    defer if (app.composition_client) |*client| {
-        _ = client.close();
+    defer if (app.composition_client) |*composition_channel| {
+        _ = composition_channel.close();
     };
     const result = app.run();
     if (app.web_state_initialized) saveBrowserStorage(&ctx.files, browser_storage, persistence_buffer);
@@ -1645,10 +1645,10 @@ const App = struct {
     }
 
     fn probeComposition(self: *App) void {
-        var client: r4os.text_composition_client.Client = undefined;
-        self.composition_status = self.ctx.app.compositionClient(self.ctx.sys.ticksFromMilliseconds(500), &client);
+        var composition_channel: r4os.text_composition_client.Client = undefined;
+        self.composition_status = self.ctx.app.compositionClient(self.ctx.sys.ticksFromMilliseconds(500), &composition_channel);
         if (self.composition_status != 0) return;
-        self.composition_client = client;
+        self.composition_client = composition_channel;
         const bound = &self.composition_client.?;
         var capability: r4os.abi.CompositionCapabilityReply = .{};
         self.composition_status = bound.capability(&capability);
