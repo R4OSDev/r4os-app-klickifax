@@ -1706,12 +1706,13 @@ const App = struct {
             return true;
         }
         var scratch: [model.url_capacity + 1]u8 = undefined;
-        var count: usize = 0;
-        self.clipboard_status = self.clipboard.read(&scratch, &count);
-        if (self.clipboard_status != 0) {
+        const result = self.clipboard.read(&scratch);
+        self.clipboard_status = if (result < 0) result else 0;
+        if (result < 0) {
             self.setStatus("Clipboard operation failed.");
             return false;
         }
+        const count: usize = @intCast(result);
         const capacity = self.address.buffer.len - 1 - self.address.len + range.end - range.start;
         if (count > capacity) {
             self.clipboard_status = r4os.abi.clipboard_offer_error_too_large;
