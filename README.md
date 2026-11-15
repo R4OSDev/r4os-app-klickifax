@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.29.29`
+- Version: `0.29.30`
 - Image target: `/R4OS/SOFTWARE/INTERNET/KLICKIFAX.R4X`
 - Image scope: `none` (on-demand)
 - Canonical project manifest: `module.R4MF`
@@ -51,10 +51,16 @@ and grapheme clusters are distinct; no shaping or BiDi support is implied.
 
 API migration0.90.75 uses SDK0.64.208 with `r4os-zig-generation2`.
 
-Page work waits for the earliest live timer, resource progress, queued job or
-bounded font-display deadline across the document and its subdocuments.
+Page work waits for the earliest live timer, resource progress or queued job
+across the document and its subdocuments, plus bounded font-display deadlines
+for the main visual document.
 Settled recurring script work keeps its 50 ms foreground slice; active
 resource progress uses 10 ms until complete. Static pages without pending
 work wait indefinitely in EventLoop. GUI input, close and font-change events
 remain independent wake sources. The existing test step covers this policy
 and exact font-demand epoch retirement.
+
+The CSS owner in SDK 0.64.224 prepares selector parts and bounded ordered
+candidate indexes at stylesheet load. Exact matching, cascade, responsive
+layout and live DOM/state reads are preserved; computed styles are not
+persistently cached. This artifact includes that implementation.
