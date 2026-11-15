@@ -14,6 +14,7 @@ const document_fonts = @import("document_fonts.zig");
 const font_run_mask = @import("font_run_mask.zig");
 const loading_view = @import("loading_view.zig");
 const native_paint = @import("native_paint.zig");
+const page_wait = @import("page_wait.zig");
 
 const AppApi = struct {
     app: *const r4os.App2,
@@ -79,8 +80,6 @@ const script_yield_interval: usize = 32;
 // Page work is cooperatively sliced. A site may own many resources, timers or
 // promise jobs, but it must never monopolize the single-vCPU desktop between
 // GUI events.
-const page_loop_sleep_ms: u64 = 10;
-const page_settled_loop_sleep_ms: u64 = 50;
 const page_runtime_jobs_per_slice: usize = 2;
 const page_settled_jobs_per_slice: usize = 1;
 const page_event_jobs_per_slice: usize = 4;
@@ -492,8 +491,7 @@ const App = struct {
                 self.render();
             }
             self.pumpPageRuntime();
-            const sleep_ms = pageLoopSleepMilliseconds(self.runtime_active, self.loading, self.page_runtime.resourcesSettled());
-            switch (events.wait(r4os.time_contract.timeoutFinite(.{ .nanoseconds = sleep_ms * 1_000_000 }))) {
+            switch (events.wait(self.pageWaitTimeout())) {
                 .message => |message| next_event = message.guiEvent(),
                 .timed_out => {},
                 .failure => |code| return code,
@@ -3263,6 +3261,26 @@ const App = struct {
         return true;
     }
 
+    fn pageWaitTimeout(self: *App) r4os.time_contract.Timeout {
+        var plan = page_wait.Plan.init(self.nowMilliseconds(), self.runtime_active and self.documentResourcesSettled());
+        if (self.loading) plan.progress();
+        if (self.runtime_active) {
+            plan.runtime(self.page_runtime, .top_level);
+            if (self.subdocuments) |*documents| {
+                for (documents.entries) |entry| if (entry) |document| {
+                    plan.runtime(&document.runtime, .subdocument);
+                };
+            }
+            if (self.document_fonts.nextDeadlineMilliseconds()) |due| plan.deadline(@floatFromInt(due));
+        }
+        // Transport completion currently has no EventLoop subscription. Poll
+        // only while a real resource job is active, including stale cleanup.
+        for (self.resource_jobs) |entry| if (entry) |slot| {
+            if (slot.request.active) plan.progress();
+        };
+        return plan.timeout();
+    }
+
     fn servicePageRequests(self: *App) void {
         self.servicePageRequestsLimited(page_resource_requests_per_slice, page_subdocument_requests_per_slice);
     }
@@ -4107,15 +4125,9 @@ fn pageRuntimeNeedsRender(
     return resource_changed or font_changed or action_changed or dom_changed;
 }
 
-fn pageLoopSleepMilliseconds(runtime_active: bool, loading: bool, resources_settled: bool) u64 {
-    // Loading remains responsive to transport/resource progress. Once the
-    // initial document is complete, untrusted recurring timers receive a
-    // bounded foreground cadence so they cannot starve the desktop.
-    return if (runtime_active and !loading and resources_settled) page_settled_loop_sleep_ms else page_loop_sleep_ms;
-}
-
 test "JavaScript jobs alone do not trigger a page reflow and repaint" {
-    try std.testing.expect(page_loop_sleep_ms > 0);
+    try std.testing.expect(page_wait.resource_progress_ms > 0);
+    try std.testing.expect(page_settled_jobs_per_slice < page_runtime_jobs_per_slice);
     try std.testing.expect(page_runtime_jobs_per_slice < 32);
     try std.testing.expect(page_resource_requests_per_slice < 16);
     try std.testing.expect(!pageRuntimeNeedsRender(32, false, false, false, false));
@@ -4123,15 +4135,6 @@ test "JavaScript jobs alone do not trigger a page reflow and repaint" {
     try std.testing.expect(pageRuntimeNeedsRender(0, false, true, false, false));
     try std.testing.expect(pageRuntimeNeedsRender(0, false, false, true, false));
     try std.testing.expect(pageRuntimeNeedsRender(0, false, false, false, true));
-}
-
-test "settled documents throttle recurring script work without slowing loading" {
-    try std.testing.expect(page_settled_loop_sleep_ms > page_loop_sleep_ms);
-    try std.testing.expect(page_settled_jobs_per_slice < page_runtime_jobs_per_slice);
-    try std.testing.expectEqual(page_loop_sleep_ms, pageLoopSleepMilliseconds(false, false, true));
-    try std.testing.expectEqual(page_loop_sleep_ms, pageLoopSleepMilliseconds(true, true, true));
-    try std.testing.expectEqual(page_loop_sleep_ms, pageLoopSleepMilliseconds(true, false, false));
-    try std.testing.expectEqual(page_settled_loop_sleep_ms, pageLoopSleepMilliseconds(true, false, true));
 }
 
 fn cssStyleForRenderOp(op: r4os.web_layout.RenderOp) r4os.css.ComputedStyle {

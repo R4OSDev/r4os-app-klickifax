@@ -162,8 +162,18 @@ pub fn build(b: *std.Build) void {
     const run_response_cache_tests = b.addRunArtifact(response_cache_tests);
     const response_cache_step = b.step("response-cache-test", "Run focused HTTP response cache tests");
     response_cache_step.dependOn(&run_response_cache_tests.step);
+    const page_wait_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/page_wait.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    page_wait_tests.root_module.addImport("r4os", sdk.createR4osModule(b.graph.host, .Debug));
+    const run_page_wait_tests = b.addRunArtifact(page_wait_tests);
     const test_step = b.step("test", "Run Klickifax navigation, inline SVG, storage and font source/cache tests");
     test_step.dependOn(&run_model_tests.step);
+    test_step.dependOn(&run_page_wait_tests.step);
     test_step.dependOn(&run_response_cache_tests.step);
     test_step.dependOn(&run_inline_svg_tests.step);
     test_step.dependOn(&run_storage_layout_tests.step);

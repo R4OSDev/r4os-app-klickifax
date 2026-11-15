@@ -208,6 +208,24 @@ pub const Set = struct {
         _ = self.coordinator.advance(self.demand_epoch, now_ms);
     }
 
+    /// Earliest remaining bounded font-display window. Unbounded swap faces
+    /// rely on their actual resource jobs, rather than an idle polling timer.
+    pub fn nextDeadlineMilliseconds(self: *const Set) ?u64 {
+        if (!self.coordinator.initialized or self.coordinator.epoch != self.demand_epoch) return null;
+        var earliest: ?u64 = null;
+        for (self.demand_mask, 0..) |demanded, index| {
+            if (!demanded or self.coordinator.phase(self.demand_epoch, @intCast(index)) != .loading) continue;
+            const period = switch (self.demand_display[index]) {
+                .optional => r4os.web_font_activation.optional_swap_period_ms,
+                .fallback => r4os.web_font_activation.fallback_swap_period_ms,
+                .auto, .block, .swap => continue,
+            };
+            const due = self.coordinator.started_ms +| period;
+            earliest = if (earliest) |old| @min(old, due) else due;
+        }
+        return earliest;
+    }
+
     /// Atomically publishes every staged face of the epoch after its single
     /// coalesced revision becomes available.
     pub fn publishRevision(self: *Set) bool {
@@ -598,4 +616,28 @@ test "two document owners share source bytes but retire independently" {
     try std.testing.expectEqual(@as(usize, 0), diagnostics.active_faces);
     try std.testing.expectEqual(@as(usize, 0), diagnostics.source_objects);
     try std.testing.expectEqual(@as(usize, 0), diagnostics.source_bytes);
+}
+
+test "font wait deadlines retire with the exact demand epoch" {
+    var set = Set.init(undefined);
+    try std.testing.expectEqual(@as(?u64, null), set.nextDeadlineMilliseconds());
+    set.demand_epoch = 7;
+    set.demand_mask[0] = true;
+    set.demand_mask[1] = true;
+    set.demand_mask[2] = true;
+    set.demand_display[0] = .optional;
+    set.demand_display[1] = .fallback;
+    set.demand_display[2] = .swap;
+    try set.coordinator.begin(7, 1000, &.{
+        .{ .face_index = 0, .display = .optional },
+        .{ .face_index = 1, .display = .fallback },
+        .{ .face_index = 2, .display = .swap },
+    });
+    try std.testing.expectEqual(@as(?u64, 1100), set.nextDeadlineMilliseconds());
+    try std.testing.expect(set.coordinator.complete(7, 0, .failed, 1050));
+    try std.testing.expectEqual(@as(?u64, 4000), set.nextDeadlineMilliseconds());
+    _ = set.coordinator.advance(7, 4000);
+    try std.testing.expectEqual(@as(?u64, null), set.nextDeadlineMilliseconds());
+    set.demand_epoch = 8;
+    try std.testing.expectEqual(@as(?u64, null), set.nextDeadlineMilliseconds());
 }
